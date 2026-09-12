@@ -11,7 +11,10 @@ estimated:
 | + `ftm_load_calibration.c`, `esp_wifi_regulatory.c` | 22 | **6** |
 
 The 22 includes 16 libc symbols that appear only because the probe links
-`-nostdlib`.
+`-nostdlib`. Read the last row as **6**; `tools/applink.sh`, added in step 4,
+does the link properly and is the number to quote from here on. See
+[step4.md](step4.md) -- the bare-`ld` probes are misleading enough that adding
+a *working* file made the count go up.
 
 ## What made ESP-IDF's sources compile
 
@@ -56,7 +59,7 @@ esp_mesh_send_event_internal
 ```
 
 Six symbols, and **this is where the work actually is.** `esp_wifi_init` is
-ESP-IDF's `wifi_init.c`: it installs the 125-entry `wifi_osi_funcs_t`, starts
+ESP-IDF's `wifi_init.c`: it installs `wifi_osi_funcs_t` (120 members on the C3), starts
 the PHY, reads calibration out of NVS and brings up the event loop. The
 adapter table is reached through it.
 
