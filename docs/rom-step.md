@@ -67,3 +67,32 @@ tools/rom-link-probe.sh 2>&1 | grep -o "undefined.*" | sort -u
 
 Needs the blobs in `blobs/` and a sparse checkout of `sync/master.c` including
 `components/esp_rom`; `survey.md` has both.
+
+## After `src/rtems_esp_glue.c`
+
+The twelve symbols in that file are written against RTEMS alone and need
+nothing from ESP-IDF, so they could be done first. Re-running the probe with
+it linked in:
+
+```
+unresolved before the glue   56
+unresolved after  the glue   48
+resolved by it               10   the ten it defines, and nothing else
+still to do, excluding libc  34
+```
+
+`tools/rom-link-probe-with-glue.sh` is the same probe with the object added;
+`tools/build-glue.sh` compiles it. It builds with `-Wall -Wextra -Werror`.
+
+What is left is now entirely `esp_phy` and `esp_wifi` data and C:
+
+- **24** `est_PHY_*_FTM_COMP_*` calibration constants
+- **2** `regdomain_table`, `regulatory_data`
+- **6** `esp_wifi_init`, `esp_wifi_connect`, `esp_wifi_disconnect`,
+  `esp_event_handler_register`, `esp_event_handler_unregister`,
+  `esp_mesh_send_event_internal`
+- **2** `printk` and `vsnprintf`, which are RTEMS and libc and appear only
+  because the probe links `-nostdlib`
+
+So step 3 is now a bounded list rather than "build three components": 32
+symbols, of which 26 are data.

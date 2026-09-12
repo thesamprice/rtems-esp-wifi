@@ -1,0 +1,154 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
+/*
+ * Copyright (C) 2026 Samuel Price <thesamprice@gmail.com>
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES ARE DISCLAIMED.  IN NO EVENT SHALL THE
+ * AUTHOR OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE.
+ */
+
+/*
+ * The part of the WiFi glue that needs nothing from ESP-IDF.
+ *
+ * docs/rom-step.md lists the 42 symbols left once the ROM linker scripts are
+ * included.  These twelve are the ones that can be written against RTEMS
+ * alone: six logging hooks, a critical section, and two event-base names.
+ * The rest need esp_phy's calibration tables or esp_wifi's own C, which is
+ * why they are not here.
+ *
+ * Written first because they are the only part that can be compiled and
+ * checked before the components build, and because getting them out of the
+ * list makes what remains easier to see.
+ */
+
+#include <rtems.h>
+#include <rtems/bspIo.h>
+
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+
+/*
+ * Logging.
+ *
+ * ESP-IDF routes these through ESP_LOGI, which reaches esp_log's tag
+ * filtering and its own vprintf hook.  Here they go to printk: the callers
+ * are the WiFi lower half, which prints from its own task and from interrupt
+ * context, and printk is the one output path on RTEMS that does not take a
+ * lock or allocate.
+ *
+ * The trailing-whitespace trim is ESP-IDF's, kept because the blobs emit
+ * messages that end in a newline and printk adds nothing -- without it every
+ * line arrives doubled.
+ */
+#define LIB_PRINTF_BUFFER 96
+
+static int rtems_esp_lib_printf(const char *tag, const char *format, va_list ap)
+{
+  char buf[LIB_PRINTF_BUFFER];
+  int len;
+  int i;
+
+  len = vsnprintf(buf, sizeof(buf) - 1, format, ap);
+  buf[sizeof(buf) - 1] = '\0';
+
+  for (i = len - 1; i >= 0; --i) {
+    if (buf[i] != '\n' && buf[i] != '\r' && buf[i] != ' ') {
+      break;
+    }
+    buf[i] = '\0';
+  }
+
+  if (i > 0) {
+    printk("%s: %s\n", tag, buf);
+  }
+
+  return len;
+}
+
+#define RTEMS_ESP_PRINTF(name, tag)                     \
+  int name(const char *format, ...)                     \
+  {                                                     \
+    va_list ap;                                         \
+    int len;                                            \
+                                                        \
+    va_start(ap, format);                               \
+    len = rtems_esp_lib_printf(tag, format, ap);        \
+    va_end(ap);                                         \
+                                                        \
+    return len;                                         \
+  }
+
+RTEMS_ESP_PRINTF(pp_printf, "wifi.pp")
+RTEMS_ESP_PRINTF(phy_printf, "wifi.phy")
+RTEMS_ESP_PRINTF(net80211_printf, "wifi.net80211")
+RTEMS_ESP_PRINTF(mesh_printf, "wifi.mesh")
+RTEMS_ESP_PRINTF(sc_printf, "wifi.smartconfig")
+RTEMS_ESP_PRINTF(coex_pti_print, "wifi.coex")
+
+/*
+ * The PHY's critical section.
+ *
+ * libphy calls this around register sequences that must not be interrupted,
+ * from task and interrupt context both, and it nests.  So it is an interrupt
+ * lock rather than a mutex: a mutex cannot be taken from an ISR, and
+ * disabling interrupts unconditionally on exit would re-enable them inside an
+ * outer critical section.
+ *
+ * RTEMS' interrupt lock returns the previous level through a context object
+ * rather than as a value, and ESP-IDF's signature returns a uint32_t.  The
+ * context is kept here rather than handed out, which is sound because the
+ * calls nest rather than interleave -- libphy always exits the section it
+ * entered last, and the level it passes back is the one it was given.
+ */
+RTEMS_INTERRUPT_LOCK_DEFINE( static, rtems_esp_phy_lock, "ESP PHY" )
+
+static rtems_interrupt_lock_context rtems_esp_phy_lock_context;
+
+uint32_t phy_enter_critical(void)
+{
+  rtems_interrupt_lock_acquire(
+    &rtems_esp_phy_lock,
+    &rtems_esp_phy_lock_context
+  );
+
+  /*
+   * The value is opaque to the caller: libphy passes back whatever it was
+   * given.  Zero rather than the saved level, because the level lives in the
+   * context above and handing out a copy would invite someone to trust it.
+   */
+  return 0;
+}
+
+void phy_exit_critical(uint32_t level)
+{
+  (void) level;
+
+  rtems_interrupt_lock_release(
+    &rtems_esp_phy_lock,
+    &rtems_esp_phy_lock_context
+  );
+}
+
+/*
+ * Event base names.
+ *
+ * ESP_EVENT_DEFINE_BASE(id) expands to `esp_event_base_t const id = #id`, and
+ * esp_event_base_t is a const char *.  Defined here rather than pulled from
+ * esp_event's C so that the blobs link before that component does; when
+ * esp_event is built for RTEMS these two move there and come out of here.
+ */
+const char *const WIFI_EVENT = "WIFI_EVENT";
+const char *const SC_EVENT = "SC_EVENT";
