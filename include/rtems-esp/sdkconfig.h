@@ -79,4 +79,36 @@
  */
 #define CONFIG_LOG_DEFAULT_LEVEL 3
 
+/*
+ * Buffer counts, all named by WIFI_INIT_CONFIG_DEFAULT() in esp_wifi.h.
+ *
+ * These are the branch's own Kconfig defaults, read out of
+ * components/esp_wifi/Kconfig rather than remembered.  They are the largest
+ * single claim the WiFi libraries make on the heap, so they are the first
+ * numbers to lower if RAM gets tight.
+ */
+#define CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM 10
+#define CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM 32
+#define CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM 32
+
+/*
+ * Dynamic TX buffers, which is the Kconfig choice's own default and also what
+ * it recommends: "If PSRAM is disabled, Dynamic should be selected to improve
+ * the utilization of RAM."  The C3 has no PSRAM -- SOC_SPIRAM_SUPPORTED is not
+ * defined for it -- so the condition is unambiguous here.
+ *
+ * ESP_WIFI_DYNAMIC_TX_BUFFER is the choice symbol; TX_BUFFER_TYPE is the int
+ * esp_wifi.h reads, and Kconfig derives one from the other.  Both are needed
+ * because esp_wifi.h tests each.
+ */
+#define CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER 1
+#define CONFIG_ESP_WIFI_TX_BUFFER_TYPE 1
+
+/* Static management-frame buffers, Kconfig's default. */
+#define CONFIG_ESP_WIFI_DYNAMIC_RX_MGMT_BUF 0
+#define CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF 5
+
+/* ESP-NOW peers. Two is Kconfig's default; nothing here uses ESP-NOW. */
+#define CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM 2
+
 #endif /* RTEMS_ESP_SDKCONFIG_H */

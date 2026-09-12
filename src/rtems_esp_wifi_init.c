@@ -55,6 +55,8 @@
 #include <rtems.h>
 #include <rtems/bspIo.h>
 
+#include <string.h>
+
 /*
  * The one thing still missing, and it is deliberate rather than forgotten.
  *
@@ -80,6 +82,26 @@ int __attribute__((weak)) esp_supplicant_init( void )
 }
 
 /*
+ * The crypto function table WIFI_INIT_CONFIG_DEFAULT() names.
+ *
+ * ESP-IDF's real one is wpa_supplicant/src/crypto/crypto_ops.c, which needs
+ * mbedtls; like esp_supplicant_init() it arrives with the supplicant and this
+ * weak definition then loses to it with no change here.
+ *
+ * Every entry is null, and the consequence is specific rather than vague: the
+ * WiFi libraries call through these for CCMP, PBKDF2 and the MIC, so an
+ * encrypted network cannot associate -- it will fault on a null call rather
+ * than fail politely, because the libraries do not check. An open network
+ * never reaches them. size and version are set because esp_wifi_init_internal()
+ * does check those, and a zero version is rejected with a message that says
+ * nothing about the cause.
+ */
+const wpa_crypto_funcs_t __attribute__((weak)) g_wifi_default_wpa_crypto_funcs = {
+  .size    = sizeof( wpa_crypto_funcs_t ),
+  .version = ESP_WIFI_CRYPTO_VERSION,
+};
+
+/*
  * ESP-IDF's sleep defaults, in the units its own esp_wifi_init() converts to.
  * They are set even with sleep disabled because the values live in the WiFi
  * library's state rather than in a sleep driver, and leaving them at zero is
@@ -93,6 +115,85 @@ int __attribute__((weak)) esp_supplicant_init( void )
  * source.  It is the per-chip PHY register set; there is no way to derive it
  * and no default. */
 extern const esp_phy_init_data_t phy_init_data;
+
+/*
+ * The blobs' own sections, placed by ld/esp32c3-wifi-sections.ld.
+ *
+ * .wifi_iram is 44 KiB of code that cannot execute from flash, so it is loaded
+ * into flash and copied into the instruction-bus window at startup; .wifi_dram
+ * is half a kilobyte of initialised data.  The BSP's
+ * bsp_start_copy_sections() knows only about its own .fast_text, and two
+ * output sections cannot share a name, so these are copied here.
+ *
+ * Done before register_chipv7_phy(), which is the first call that can reach
+ * blob code.
+ */
+extern char rtems_esp_wifi_iram_begin[];
+extern char rtems_esp_wifi_iram_end[];
+extern char rtems_esp_wifi_iram_load_begin[];
+extern char rtems_esp_wifi_dram_begin[];
+extern char rtems_esp_wifi_dram_end[];
+extern char rtems_esp_wifi_dram_load_begin[];
+
+/*
+ * The instruction window cannot be written through, so stores go to the same
+ * SRAM through the data window.  The BSP defines the offset between the two;
+ * see the comment on esp32c_iram_to_dram_delta in the BSP's linkcmds.
+ */
+extern char esp32c_iram_to_dram_delta[];
+
+/*
+ * The load addresses from the linker script are offsets from zero, because
+ * CODE_FLASH_RAW and DATA_FLASH_RAW both have ORIGIN 0x0 -- they describe where
+ * bytes sit in the flash image, not an address the CPU can read.  Reading one
+ * directly faults with mcause 0x5, a load access fault, which is what the first
+ * version of this function did.
+ *
+ * 0x3c000000 is the data-mapped flash base.  The BSP does exactly this in
+ * bsps/riscv/esp32/start/bspstart.c's copy_from_flash_offset() for its own
+ * .data and .fast_text; the constant is repeated here rather than shared
+ * because the BSP does not export it.
+ */
+#define RTEMS_ESP_FLASH_MAPPED_BASE 0x3c000000
+
+static void rtems_esp_wifi_copy_sections( void )
+{
+  size_t    iram_size = (size_t) ( rtems_esp_wifi_iram_end
+                                     - rtems_esp_wifi_iram_begin );
+  size_t    dram_size = (size_t) ( rtems_esp_wifi_dram_end
+                                     - rtems_esp_wifi_dram_begin );
+  uintptr_t delta     = (uintptr_t) esp32c_iram_to_dram_delta;
+
+  if ( iram_size != 0 ) {
+    /*
+     * Written through the data window, not the instruction window.  The two
+     * address the same SRAM and stores are only guaranteed through the data
+     * bus; esp32c_iram_to_dram_delta comes from the BSP's linker script so
+     * that the layout is stated in one place.
+     */
+    memcpy(
+      (void *) ( (uintptr_t) rtems_esp_wifi_iram_begin + delta ),
+      (const void *) ( (uintptr_t) rtems_esp_wifi_iram_load_begin
+                         + RTEMS_ESP_FLASH_MAPPED_BASE ),
+      iram_size
+    );
+  }
+
+  if ( dram_size != 0 ) {
+    memcpy(
+      rtems_esp_wifi_dram_begin,
+      (const void *) ( (uintptr_t) rtems_esp_wifi_dram_load_begin
+                         + RTEMS_ESP_FLASH_MAPPED_BASE ),
+      dram_size
+    );
+  }
+
+  printk(
+    "rtems-esp-wifi: copied %u bytes of IRAM and %u of DRAM\n",
+    (unsigned) iram_size,
+    (unsigned) dram_size
+  );
+}
 
 static bool rtems_wifi_inited;
 
@@ -133,6 +234,8 @@ esp_err_t esp_wifi_init( const wifi_init_config_t *config )
     return ESP_ERR_INVALID_ARG;
   }
 
+  rtems_esp_wifi_copy_sections();
+
   esp_wifi_set_sleep_min_active_time( RTEMS_WIFI_MIN_ACTIVE_TIME_US );
   esp_wifi_set_keep_alive_time( RTEMS_WIFI_KEEP_ALIVE_TIME_US );
   esp_wifi_set_sleep_wait_broadcast_data_time(
@@ -145,6 +248,8 @@ esp_err_t esp_wifi_init( const wifi_init_config_t *config )
    * rejects *input* calibration data, which cannot happen here, so anything
    * non-zero is worth reporting rather than ignoring.
    */
+  printk( "rtems-esp-wifi: register_chipv7_phy( PHY_RF_CAL_FULL )...\n" );
+
   phy_result = register_chipv7_phy(
     &phy_init_data,
     &rtems_wifi_cal_data,
@@ -157,6 +262,8 @@ esp_err_t esp_wifi_init( const wifi_init_config_t *config )
     return ESP_FAIL;
   }
 
+  printk( "rtems-esp-wifi: PHY registered, esp_wifi_init_internal()...\n" );
+
   result = esp_wifi_init_internal( config );
 
   if ( result != ESP_OK ) {
@@ -164,6 +271,8 @@ esp_err_t esp_wifi_init( const wifi_init_config_t *config )
 
     return result;
   }
+
+  printk( "rtems-esp-wifi: libraries initialised, esp_supplicant_init()...\n" );
 
   result = esp_supplicant_init();
 
