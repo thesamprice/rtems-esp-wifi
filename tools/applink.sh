@@ -8,6 +8,17 @@ SP=${SP:-$(cd "$(dirname "$0")/../.." && pwd)}
 LIB=$SP/iram-prefix/riscv-rtems7/esp32c3db/lib
 LD=$SP/hal/components/esp_rom/esp32c3/ld
 export PATH=$HOME/rtems/7/bin:$PATH
+# Check the inputs exist before linking.  Without this a wrong SP, or a
+# missing fetch, makes ld fail on its first argument -- and the script then
+# reports *zero* unresolved symbols, which reads as success.  That has
+# happened twice.
+set -eu
+for f in "$LIB/librtemsbsp.a" "$LD/esp32c3.rom.ld" "$SP/blobs/libpp.a" \
+         "$SP/adapter.o" "$SP/confdefs-probe.o"; do
+  [ -r "$f" ] || { echo "applink.sh: missing $f (is SP right?)" >&2; exit 2; }
+done
+set +e
+
 riscv-rtems7-gcc -march=rv32imc -mabi=ilp32 -B $LIB -qrtems \
   -o $SP/applink.elf \
   $SP/confdefs-probe.o $SP/rtems_esp_glue.o $SP/ftm.o $SP/reg.o $SP/adapter.o $SP/romtest.o \
@@ -21,3 +32,4 @@ riscv-rtems7-gcc -march=rv32imc -mabi=ilp32 -B $LIB -qrtems \
   -Wl,-T,$LD/esp32c3.rom.libc.ld -Wl,-T,$LD/esp32c3.rom.version.ld \
   -Wl,-T,$LD/esp32c3.rom.eco3.ld \
   -lm 2>&1
+
