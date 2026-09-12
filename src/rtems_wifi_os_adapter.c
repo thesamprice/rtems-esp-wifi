@@ -45,6 +45,8 @@
 
 #include "esp_private/wifi_os_adapter.h"
 
+#include <rtems-esp/event.h>
+
 #include <rtems.h>
 #include <rtems/bspIo.h>
 #include <rtems/libcsupport.h>
@@ -796,16 +798,6 @@ static uint32_t rtems_wifi_stub_event_group_wait_bits( void *event, uint32_t bit
   return 0;
 }
 
-static int32_t rtems_wifi_stub_event_post( const char* event_base, int32_t event_id, void* event_data, size_t event_data_size, uint32_t ticks_to_wait )
-{
-  (void) event_base;
-  (void) event_id;
-  (void) event_data;
-  (void) event_data_size;
-  (void) ticks_to_wait;
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_event" );
-  return ESP_FAIL;
-}
 
 static void rtems_wifi_stub_dport_access_stall_other_cpu_start_wrap( void )
 {
@@ -1261,7 +1253,7 @@ wifi_osi_funcs_t g_wifi_osi_funcs = {
   ._task_get_max_priority = rtems_wifi_task_get_max_priority,
   ._malloc = rtems_wifi_malloc,
   ._free = rtems_wifi_free,
-  ._event_post = rtems_wifi_stub_event_post,
+  ._event_post = rtems_esp_event_post,
   ._get_free_heap_size = rtems_wifi_get_free_heap_size,
   ._rand = rtems_wifi_rand,
   ._dport_access_stall_other_cpu_start_wrap = rtems_wifi_stub_dport_access_stall_other_cpu_start_wrap,

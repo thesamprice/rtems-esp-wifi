@@ -39,6 +39,8 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 /*
  * Logging.
@@ -152,3 +154,95 @@ void phy_exit_critical(uint32_t level)
  */
 const char *const WIFI_EVENT = "WIFI_EVENT";
 const char *const SC_EVENT = "SC_EVENT";
+
+/* === randomness ======================================================== */
+
+/*
+ * esp_hw_support's public randomness API.  On hardware these read the RNG
+ * register, which mixes the SAR ADC and the RC fast clock and is only a real
+ * random source while the radio is on.
+ *
+ * Here they are getentropy(), which is the same source the OS adapter's _rand
+ * entry uses -- on this board bsps/shared/dev/getentropy/getentropy-cpucounter.c,
+ * which is a CPU counter and says so in its own header.  That is weak, and it
+ * is worth being precise about the consequence: the supplicant uses os_random()
+ * for nonces, so on a board whose getentropy is the counter fallback, WPA
+ * nonces are predictable to anyone who knows the boot timing.  Good enough to
+ * associate and bring a station up, which is what this port is for; not good
+ * enough to deploy.
+ *
+ * A BSP with a real entropy source needs no change here -- getentropy() is the
+ * seam, and RTEMS picks the implementation per BSP.
+ */
+uint32_t esp_random( void )
+{
+  uint32_t value;
+
+  if ( getentropy( &value, sizeof( value ) ) != 0 ) {
+    value = (uint32_t) rtems_clock_get_uptime_nanoseconds();
+  }
+
+  return value;
+}
+
+void esp_fill_random( void *buf, size_t len )
+{
+  if ( buf == NULL || len == 0 ) {
+    return;
+  }
+
+  if ( getentropy( buf, len ) != 0 ) {
+    /*
+     * Fill rather than leave the caller's buffer untouched.  A partially
+     * written key buffer is worse than a weak one, because the caller has no
+     * way to tell.
+     */
+    unsigned char *p = buf;
+    size_t         i;
+
+    for ( i = 0; i < len; ++i ) {
+      p[ i ] = (unsigned char) esp_random();
+    }
+  }
+}
+
+/* === the supplicant's clock ============================================ */
+
+/*
+ * os_get_time() for wpa_supplicant.
+ *
+ * Why this is here at all: the blobs want hexstr2bin, which lives in the
+ * supplicant's src/utils/common.c, and that object also contains
+ * wpa_get_ntp_timestamp() -- the one caller of os_get_time().  Nothing on the
+ * station path calls it, but a reference in the object is a reference at link
+ * time regardless.
+ *
+ * The supplicant's own port/os_xtensa.c has this function and is identical to
+ * it (gettimeofday into the two fields).  Compiling that file instead needs
+ * mbedtls configured, for an #include serving a forced_memzero() that is
+ * behind CONFIG_CRYPTO_MBEDTLS and not compiled -- disproportionate for six
+ * lines.
+ *
+ * Weak, so when the supplicant comes in properly its strong definition wins
+ * with no change here and no duplicate-symbol error.  struct os_time is laid
+ * out by port/include/os.h as { os_time_t sec; suseconds_t usec; }; it is
+ * declared locally rather than by including os.h, because os.h drags in the
+ * supplicant's whole header chain into a file that otherwise needs none of it.
+ */
+struct rtems_esp_os_time {
+  time_t      sec;
+  suseconds_t usec;
+};
+
+int __attribute__((weak)) os_get_time( struct rtems_esp_os_time *t )
+{
+  struct timeval tv;
+  int            rv;
+
+  rv = gettimeofday( &tv, NULL );
+
+  t->sec  = tv.tv_sec;
+  t->usec = tv.tv_usec;
+
+  return rv;
+}

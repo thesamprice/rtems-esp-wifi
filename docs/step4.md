@@ -104,11 +104,41 @@ event loop, which is step 5. `hexstr2bin` is in wpa_supplicant's
 
 Nothing in the OS surface is outstanding.
 
-## One probe artifact, so it is not mistaken for a constraint
+## The section overflow is real, not a probe artifact
 
-`applink.sh` takes the blobs `--whole-archive` and overflows
-`UNEXPECTED_SECTIONS` by 95 KiB. That is mesh, espnow and smartconfig being
-pulled in whole, together with sections the BSP's `linkcmds` does not place. A
-real build takes neither the whole archives nor those sections unplaced. It
-says nothing about whether the part has room; the footprint numbers in the
-README do, and they say it has.
+`applink.sh` overflows `UNEXPECTED_SECTIONS` by 93 KiB. This was first written
+down here as an artifact of linking the blobs `--whole-archive`. That was
+wrong: linking them the way a real build does, pulled on demand, still
+overflows by 93 KiB. The blobs have section names the BSP's `linkcmds` does not
+place, and `linkcmds` sweeps what it does not recognise into
+`UNEXPECTED_SECTIONS` so it surfaces as an error rather than landing somewhere
+quietly.
+
+From the link map, 1549 input sections and 89.2 KiB before alignment:
+
+| family | size | has to live |
+|---|---:|---|
+| `.wifi0iram.*` | 11.7 KiB | IRAM |
+| `.wifislprxiram.*` | 8.8 KiB | IRAM |
+| `.wifiextrairam.*` | 6.5 KiB | IRAM |
+| `.wifirxiram.*` | 5.7 KiB | IRAM |
+| `.wifislpiram.*` | 5.4 KiB | IRAM |
+| `.iram1`, `.iram1.*` | 5.8 KiB | IRAM |
+| `.wifiorslpiram.*` | 0.1 KiB | IRAM |
+| `.rodata_wlog_*` | 44.8 KiB | flash |
+| `.dram1.*` | 0.5 KiB | DRAM |
+
+So 44.0 KiB must be in internal SRAM; the other 44.8 KiB is log strings that
+belong in flash and were never a constraint.
+
+The IRAM half is what `ESP32C_IRAM_REGION_SIZE` and `REGION_FAST_TEXT` were
+added for in step 1, and it sets the size: at least `0xB000`, where
+`config_esp32c3db_iram.ini` sets `0x2000` because that was what the test
+proving the region works needed.
+
+A bigger part does not avoid it. `SOC_SPIRAM_SUPPORTED` is not defined for the
+C3 -- it has no external RAM interface -- and on the parts that do have PSRAM
+this code still could not go there: these sections exist because the code runs
+while the flash cache is unavailable, during a flash write and in interrupt
+handlers, and PSRAM is reached through the same MSPI controller and is
+unavailable at the same moments.

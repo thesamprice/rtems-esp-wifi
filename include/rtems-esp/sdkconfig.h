@@ -55,4 +55,28 @@
 /* The C3 is 2.4 GHz only. */
 #define CONFIG_SOC_WIFI_SUPPORT_5G 0
 
+/*
+ * Maximum transmit power, in dBm, asked for by esp_phy/esp32c3/phy_init_data.c
+ * -- which clamps it to 0x50 in quarter-dBm, so 20 dBm is also the ceiling the
+ * data allows.  20 is ESP-IDF's own Kconfig default.
+ *
+ * This is a regulatory limit as well as a hardware one, and the number that
+ * applies depends on where the radio is operated and on the antenna.  It is
+ * here because the PHY data will not compile without it, not because 20 has
+ * been checked against any particular jurisdiction; the country setting that
+ * governs channels goes in separately through esp_wifi_set_country_code().
+ */
+#define CONFIG_ESP_PHY_MAX_TX_POWER 20
+
+/*
+ * Log level, asked for by log/include/esp_log_level.h once anything includes
+ * esp_log.h -- which the supplicant's headers do.
+ *
+ * 3 is ESP_LOG_INFO, ESP-IDF's own default.  It only sets the compile-time
+ * ceiling for ESP_LOGx in ESP-IDF sources; this port routes those through
+ * printk in src/rtems_esp_glue.c rather than through esp_log's own writer, so
+ * raising it produces more output and not a different mechanism.
+ */
+#define CONFIG_LOG_DEFAULT_LEVEL 3
+
 #endif /* RTEMS_ESP_SDKCONFIG_H */
