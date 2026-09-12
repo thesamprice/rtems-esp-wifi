@@ -3,10 +3,11 @@
 Glue between RTEMS and Espressif's WiFi HAL for the ESP32-C3, so that a
 MicroPython script on RTEMS can join a network.
 
-**Nothing works yet.** This repository currently holds the survey that decides
-whether and how it can be built, and the survey found two blockers that have to
-be cleared first. Both are recorded below with the measurements behind them, so
-the next person starts from evidence rather than from an estimate.
+**Nothing works yet.** This repository holds the survey that decides whether
+and how it can be built. Of the two blockers it first reported, one turned out
+not to exist and the other has been cleared; both corrections are below with
+the measurements behind them, so the next person starts from evidence rather
+than from an estimate.
 
 Kept separate from `rtems-lwip` and from the RTEMS MicroPython port on purpose:
 the HAL is 300 MB of synchronised ESP-IDF and must not land in either tree.
@@ -43,31 +44,56 @@ genuinely external                    163
 function pointers**, which is a tempting coincidence — but the two sets are not
 the same thing, and that is the first blocker.
 
-### Blocker 1: there is no clean OS-adapter seam
+### Correction: there *is* a clean seam, and the first survey said otherwise
 
-Most of the 125 external symbols are not OS functions. They are **internal
-globals of other ESP-IDF components**:
+The first pass here claimed the blobs had no OS-adapter seam, on the evidence
+that most external symbols were "internal globals of other ESP-IDF
+components" -- `g_ic_ptr`, `pTxRx`, `wDevCtrl_ptr`, `lmacConfMib_ptr`,
+`g_osi_funcs_p`, `g_chm`.
+
+**That was wrong, and wrong in a way worth recording.** Every one of those is
+an ESP32-C3 **ROM** symbol, declared in
+`components/esp_rom/esp32c3/ld/esp32c3.rom.ld`. They live in the chip's mask
+ROM. Nothing has to be written for them; a linker script has to be included.
+
+The first pass went wrong for two avoidable reasons: it downloaded three of
+the eight blobs, so symbols defined in the other five looked external, and it
+never checked the ROM linker scripts because the sparse checkout did not
+include `components/esp_rom`.
+
+With all eight blobs and the ROM scripts present:
 
 ```
-g_osi_funcs_p  g_ic_ptr  g_chm  pTxRx  wDevCtrl_ptr  lmacConfMib_ptr
-g_net80211_tx_func  s_netstack_free  if_ctrl_ptr  pp_wdev_funcs
-est_PHY_INIT_FTM_COMP_*  (26 PHY calibration constants)
-mesh_*  (12, from libmesh)
+external with every blob present         157
+   compiler runtime (__*)                 33   toolchain
+   libc                                   16   toolchain
+   to be provided                        106
+      ESP32-C3 ROM                        65   include esp32c3.rom.ld
+      component esp_wifi (C)              33
+      component esp_phy (C)                3
+      component esp_event (C)              2
+      unresolved                           3   SC_EVENT WIFI_EVENT coex_pti_print
 ```
 
-So "implement `wifi_osi_funcs_t` and link the blobs" does not describe the job.
-The blobs are one layer of a stack whose other layers — `esp_phy`,
-`esp_hw_support`, `esp_timer`, `esp_event`, NVS, and part of the WiFi upper
-half — also have to come from `esp-hal-3rdparty` and be made to build on RTEMS.
+The three unresolved are trivial: `WIFI_EVENT` and `SC_EVENT` are
+`esp_event_base_t` name globals, `coex_pti_print` a coexistence debug hook.
 
-That is what NuttX did, and its adapter is the right thing to read before
-starting: `apache/nuttx` `arch/risc-v/src/esp32c3/esp_wifi_adapter.c` is **81
-KiB of C**, with `esp_coex_adapter.c` (16 KiB) beside it and
-`esp_wifi_api.c` / `esp_wifi_event_handler.c` / `esp_timer_adapter.c` in
-`arch/risc-v/src/common/espressif/`. Call it 3–4 thousand lines of glue, for an
-RTOS that already had the surrounding components ported.
+So the seam is exactly what the header says -- `wifi_osi_funcs_t`, reached
+through the ROM's `g_osi_funcs_p` -- and the work is:
 
-### Blocker 2: the blobs need IRAM and the BSP has none
+1. build the C of `esp_wifi`, `esp_phy` and `esp_event` for RTEMS, and
+2. implement the 125-entry OS adapter.
+
+That is what NuttX did; its adapter is 81 KiB of C
+(`apache/nuttx` `arch/risc-v/src/esp32c3/esp_wifi_adapter.c`) with
+`esp_coex_adapter.c` at 16 KiB beside it. The earlier estimate of 3-4 thousand
+lines stands; what changed is its *nature*. It is an adapter, not a port of
+five components' internals.
+
+The hard half is (1), not (2): those sources are written against FreeRTOS
+headers and a Kconfig-generated `sdkconfig.h`.
+
+### Cleared: the blobs need IRAM, and the BSP now has a region for it
 
 ```
 RAM .bss                                      9.8 KiB
@@ -89,8 +115,19 @@ and on `riscv/esp32c3db` `REGION_FAST_TEXT` is aliased to
 ESP32-C3 reaches its SRAM for instruction fetch through a window near
 `0x4037c000` that neither the BSP nor the QEMU model defines.
 
-That is the same blocker as rtems-esphome#42, which wants it for a flash
-driver. It has to be cleared for either.
+That was the same blocker as rtems-esphome#42, and it is now cleared:
+`patches/rtems/0009-esp32c3-iram-region.patch` in rtems-esphome adds a
+`RAM_CODE` region at `0x40380000` sized by `ESP32C_IRAM_REGION_SIZE`, and
+`tests/bsp-iram` shows a function linking there and running.
+
+The BSP was the only half missing. QEMU already modelled the window --
+`DRAM` is created as an alias into `IRAM` at offset `0x4000`, the same
+arrangement the silicon has -- which the first pass here also got wrong.
+
+Worth knowing before relying on it: with the old arrangement
+`REGION_FAST_TEXT` aliased to flash, so the boot copy wrote to memory-mapped
+flash and *any* use of `.fast_text` faulted at boot with a store access
+fault. There was never a slow-but-working version.
 
 ## esp-lwip
 
@@ -105,14 +142,19 @@ What the WiFi side needs from the TCP/IP side is a netif: `s_netstack_free` and
 
 ## Order of work
 
-1. An instruction-bus SRAM region for `riscv/esp32c3db`, and a QEMU model that
-   implements the window. Blocks everything else here and rtems-esphome#42.
-2. Build `esp_hw_support`, `esp_phy`, `esp_timer`, `esp_event` and NVS from
-   `sync/master.c` for RTEMS. This is the bulk of it.
-3. The OS adapter, modelled on NuttX's.
-4. A netif joining it to `rtems-lwip`.
-5. `network.WLAN` in MicroPython, which is the smallest piece — MicroPython
-   already has `extmod/modnetwork.c` and `extmod/network_lwip.c`.
+1. ~~An instruction-bus SRAM region for `riscv/esp32c3db`~~ — **done**,
+   rtems-esphome `db64d83`.
+2. Include `esp32c3.rom.ld` so the 65 ROM symbols resolve. Cheap, and it
+   should be done first because it shrinks the apparent surface by two thirds
+   and stops anyone reimplementing ROM.
+3. Build the C of `esp_wifi`, `esp_phy` and `esp_event` for RTEMS. **The bulk
+   of the work**, because those sources are written against FreeRTOS headers
+   and a generated `sdkconfig.h`.
+4. The 125-entry OS adapter, modelled on NuttX's.
+5. A netif joining it to `rtems-lwip` — `s_netstack_free` and
+   `g_net80211_tx_func` are that seam.
+6. `network.WLAN` in MicroPython, the smallest piece, since
+   `extmod/modnetwork.c` and `extmod/network_lwip.c` already exist.
 
 The Python API is the last step and the least of the work. Anyone starting at
 that end will be blocked immediately.

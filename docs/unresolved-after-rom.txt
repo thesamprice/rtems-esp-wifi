@@ -1,0 +1,3 @@
+SC_EVENT
+WIFI_EVENT
+coex_pti_print
