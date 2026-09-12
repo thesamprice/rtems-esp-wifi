@@ -38,6 +38,12 @@
  *     calibrates from scratch.  ESP-IDF uses NVS only to cache the result and
  *     shorten the next boot; it is not required to bring the radio up.  The
  *     cost is calibration time on every boot.
+ *
+ *     PHY_RF_CAL_NONE is not a way to shorten this under emulation, which is
+ *     worth writing down because it looks like one.  Measured: it stops in
+ *     exactly the same place, txdc_cal_v70+0xcc, because TX DC calibration
+ *     runs whatever the mode says.  "None" refers to the slow full RF sweep,
+ *     not to PHY bring-up.
  *   * No coexistence.  There is no Bluetooth here to coexist with.
  *   * No sleep.  Every power-management entry point in ESP-IDF's version is
  *     behind CONFIG_PM_ENABLE or CONFIG_FREERTOS_USE_TICKLESS_IDLE.
