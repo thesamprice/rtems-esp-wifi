@@ -111,4 +111,39 @@
 /* ESP-NOW peers. Two is Kconfig's default; nothing here uses ESP-NOW. */
 #define CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM 2
 
+/*
+ * wpa_supplicant's feature set.
+ *
+ * The supplicant is one body of source covering WPA2-PSK, WPA3-SAE and
+ * enterprise EAP, and its structs change shape with these -- omitting one does
+ * not disable a feature so much as produce a different ABI.  The compile error
+ * is honest ("struct wpa_auth_config has no member named ieee80211w"), which
+ * is how this set was arrived at rather than guessed.
+ *
+ * The target is a WPA2-PSK station.  That choice is what keeps mbedtls small:
+ * SAE and EAP-TLS are where the 190 mbedtls_mpi_ and 181 mbedtls_ecp_ call
+ * sites live, and those pull in bignum, ECP, X.509 and TLS -- which in this
+ * mbedtls are not even built by a PSA configuration.  A PSK station needs only
+ * AES, SHA-1, SHA-256, HMAC and PBKDF2.
+ */
+
+/*
+ * Protected management frames.  On rather than off: WPA3-transition access
+ * points require PMF, and an increasing number of WPA2-only ones are
+ * configured to as well, so a station without it fails to associate with
+ * networks that look ordinary.
+ */
+#define CONFIG_IEEE80211W 1
+
+/*
+ * No WPA3-SAE and no enterprise EAP for now.  Both are wanted eventually;
+ * both need the elliptic-curve and TLS halves of mbedtls, which is its own
+ * piece of work rather than a flag.
+ */
+#undef CONFIG_WPA3_SAE
+#undef CONFIG_SAE
+#undef CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT
+#undef CONFIG_WPA_MBEDTLS_CRYPTO
+#undef CONFIG_WPS
+
 #endif /* RTEMS_ESP_SDKCONFIG_H */

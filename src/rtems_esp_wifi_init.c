@@ -64,48 +64,26 @@
 #include <string.h>
 
 /*
- * The one thing still missing, and it is deliberate rather than forgotten.
+ * esp_supplicant_init() and g_wifi_default_wpa_crypto_funcs are NOT defined
+ * here any more, and their absence is deliberate.
  *
- * esp_supplicant_init() is what ESP-IDF's esp_wifi_init() calls to bring up
- * WPA2, and without it an association to any encrypted AP fails.  The
- * supplicant is components/wpa_supplicant in the same branch -- 145 C files
- * and mbedtls -- so it is a build to arrange, not code to write, and it is
- * kept as its own step rather than smuggled in here.
+ * They were weak stubs, so that a build without wpa_supplicant would link and
+ * an open network would still associate.  That stopped being safe the moment
+ * the real supplicant existed: a weak definition satisfies the reference, so
+ * ld never searches the archive for the strong one.  The link succeeded,
+ * reported zero undefined symbols, and produced an image that silently could
+ * not do WPA2 -- with nm showing "W" instead of "T" as the only outward sign.
+ * -u does not fix it either, because the weak definition is still a
+ * definition by the time the archive is reached.
  *
- * Declared weak so that linking the supplicant in is the only change needed:
- * with it present the real one wins, and without it this reports rather than
- * failing to link.  An open network would associate either way, which is what
- * makes this worth having now instead of after the supplicant.
+ * So they come from libwpa.a now and from nowhere else.  A build that omits
+ * the supplicant fails to link, naming the two symbols, which is a better
+ * answer than a station that associates with nothing and cannot say why.
+ *
+ * Declared rather than included: esp_wpa.h drags in the supplicant's whole
+ * header chain, and this file needs two symbols from it.
  */
-int __attribute__((weak)) esp_supplicant_init( void )
-{
-  printk(
-    "rtems-esp-wifi: esp_supplicant_init is not linked in; "
-    "only open networks will associate\n"
-  );
-
-  return ESP_OK;
-}
-
-/*
- * The crypto function table WIFI_INIT_CONFIG_DEFAULT() names.
- *
- * ESP-IDF's real one is wpa_supplicant/src/crypto/crypto_ops.c, which needs
- * mbedtls; like esp_supplicant_init() it arrives with the supplicant and this
- * weak definition then loses to it with no change here.
- *
- * Every entry is null, and the consequence is specific rather than vague: the
- * WiFi libraries call through these for CCMP, PBKDF2 and the MIC, so an
- * encrypted network cannot associate -- it will fault on a null call rather
- * than fail politely, because the libraries do not check. An open network
- * never reaches them. size and version are set because esp_wifi_init_internal()
- * does check those, and a zero version is rejected with a message that says
- * nothing about the cause.
- */
-const wpa_crypto_funcs_t __attribute__((weak)) g_wifi_default_wpa_crypto_funcs = {
-  .size    = sizeof( wpa_crypto_funcs_t ),
-  .version = ESP_WIFI_CRYPTO_VERSION,
-};
+extern int esp_supplicant_init( void );
 
 /*
  * ESP-IDF's sleep defaults, in the units its own esp_wifi_init() converts to.
