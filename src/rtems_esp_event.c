@@ -358,6 +358,43 @@ int32_t rtems_esp_event_post(
   return ESP_OK;
 }
 
+esp_err_t esp_event_post(
+  esp_event_base_t event_base,
+  int32_t          event_id,
+  const void      *event_data,
+  size_t           event_data_size,
+  TickType_t       ticks_to_wait
+)
+{
+  /*
+   * ESP-IDF's public posting API, as distinct from rtems_esp_event_post(),
+   * which is what the OS adapter's _event_post table entry calls.  They are
+   * the same operation reached from two directions: the WiFi libraries go
+   * through the table, and everything built from ESP-IDF sources -- the
+   * supplicant is the first -- calls this.
+   *
+   * The const is dropped deliberately.  ESP-IDF takes event_data as const and
+   * copies it; rtems_esp_event_post() also copies it, into the queue message,
+   * and never writes through the pointer.  The cast is here rather than in the
+   * signature because the signature has to match ESP-IDF's exactly -- a
+   * mismatch would compile in every translation unit that includes
+   * esp_event.h and fail only at link, which is the hardest kind to place.
+   *
+   * The return is esp_err_t, where success is 0.  That is NOT the convention
+   * used by the queue and semaphore entries of the OS adapter, which are
+   * FreeRTOS-shaped and return 1 for success; getting the two confused there
+   * cost an afternoon and produced ESP_ERR_WIFI_POST from a queue that was
+   * working perfectly.  rtems_esp_event_post() is on this side of that line.
+   */
+  return (esp_err_t) rtems_esp_event_post(
+    event_base,
+    event_id,
+    (void *) event_data,
+    event_data_size,
+    (uint32_t) ticks_to_wait
+  );
+}
+
 esp_err_t esp_event_handler_register(
   esp_event_base_t    event_base,
   int32_t             event_id,
