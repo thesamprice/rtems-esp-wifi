@@ -110,8 +110,18 @@
  * whatever else happens.  Given that, a second interface is a second static
  * and a second trampoline, not a data structure.  docs/step8-netif.md says
  * what AP mode would take.
+ *
+ * It is a static *pointer* to storage the caller may supply, rather than
+ * static storage outright, and the reason is rtems-lwip: start_networking()
+ * passes the application's own netif down through esp32c3_netif_add(), and an
+ * application that then asks netif_is_up() about the netif it handed over has
+ * to be asking about the one that was really added.  rtems_esp_netif_own is
+ * what a caller with no opinion gets.  The argument above is untouched by
+ * this: there is still exactly one station and the callback still finds it
+ * through a static.
  */
-static struct netif                  rtems_esp_netif;
+static struct netif                  rtems_esp_netif_own;
+static struct netif                 *rtems_esp_netif;
 static const rtems_esp_netif_driver *rtems_esp_netif_driver_ops;
 static bool                          rtems_esp_netif_added;
 static bool                          rtems_esp_netif_attached;
@@ -329,7 +339,7 @@ void rtems_esp_netif_input( void *frame, uint16_t len, void *eb )
     return;
   }
 
-  if ( rtems_esp_netif.input( p, &rtems_esp_netif ) != ERR_OK ) {
+  if ( rtems_esp_netif->input( p, rtems_esp_netif ) != ERR_OK ) {
     /*
      * tcpip_input owns the pbuf only once it has posted it; on ERR_MEM -- no
      * message from MEMP_TCPIP_MSG_INPKT, or a full TCPIP_MBOX_SIZE mailbox --
@@ -416,25 +426,25 @@ static err_t rtems_esp_netif_init( struct netif *netif )
 static void rtems_esp_netif_do_link_up( void *ctx )
 {
   (void) ctx;
-  netif_set_link_up( &rtems_esp_netif );
+  netif_set_link_up( rtems_esp_netif );
 }
 
 static void rtems_esp_netif_do_link_down( void *ctx )
 {
   (void) ctx;
-  netif_set_link_down( &rtems_esp_netif );
+  netif_set_link_down( rtems_esp_netif );
 }
 
 static void rtems_esp_netif_do_up( void *ctx )
 {
   (void) ctx;
-  netif_set_up( &rtems_esp_netif );
+  netif_set_up( rtems_esp_netif );
 }
 
 static void rtems_esp_netif_do_down( void *ctx )
 {
   (void) ctx;
-  netif_set_down( &rtems_esp_netif );
+  netif_set_down( rtems_esp_netif );
 }
 
 static void rtems_esp_netif_core_call(
@@ -555,6 +565,7 @@ static void rtems_esp_netif_on_wifi_event(
 }
 
 struct netif *rtems_esp_netif_add(
+  struct netif                 *netif,
   const rtems_esp_netif_driver *driver,
   const ip4_addr_t             *ipaddr,
   const ip4_addr_t             *netmask,
@@ -598,12 +609,20 @@ struct netif *rtems_esp_netif_add(
   rtems_esp_netif_driver_ops = driver;
 
   /*
+   * Published before netif_add, because netif_add runs the init callback and
+   * -- once the tcpip thread is running -- may announce the interface before
+   * it returns.  Anything reached from there that looks the netif up must find
+   * it already.
+   */
+  rtems_esp_netif = netif != NULL ? netif : &rtems_esp_netif_own;
+
+  /*
    * tcpip_input, not netif_input.  The long comment on
    * rtems_esp_netif_input() says why; the short version is that the receive
    * callback runs on the WiFi task and the IP stack should not.
    */
   added = netif_add(
-    &rtems_esp_netif,
+    rtems_esp_netif,
     ipaddr,
     netmask,
     gateway,
@@ -616,6 +635,7 @@ struct netif *rtems_esp_netif_add(
     printk( "rtems-esp-netif: netif_add failed\n" );
     rtems_semaphore_delete( rtems_esp_netif_staging_lock );
     rtems_esp_netif_driver_ops = NULL;
+    rtems_esp_netif = NULL;
 
     return NULL;
   }
@@ -641,12 +661,12 @@ struct netif *rtems_esp_netif_add(
             "follow the radio\n" );
   }
 
-  return &rtems_esp_netif;
+  return rtems_esp_netif;
 }
 
 struct netif *rtems_esp_netif_get( void )
 {
-  return rtems_esp_netif_added ? &rtems_esp_netif : NULL;
+  return rtems_esp_netif_added ? rtems_esp_netif : NULL;
 }
 
 const rtems_esp_netif_stats *rtems_esp_netif_get_stats( void )
@@ -758,3 +778,79 @@ const rtems_esp_netif_driver rtems_esp_netif_blob_driver = {
   .release_rx = rtems_esp_netif_blob_release_rx,
   .get_mac    = rtems_esp_netif_blob_get_mac
 };
+
+/*
+ * rtems-lwip's hook, and the reason this file is on the link line at all.
+ *
+ * rtemslwip/esp32c3/netstart.c brings the stack up and then calls this weakly
+ * declared function to get an interface.  Defining it strongly here is what
+ * joins the two halves of the port: an application calls start_networking()
+ * and gets a WiFi station without naming anything in this file.
+ *
+ * It lives below the comment band, with the blob driver, because it names
+ * rtems_esp_netif_blob_driver.  A substitution -- an ESP32 Open MAC driver,
+ * say -- replaces this function along with the table above it, and the half of
+ * the file above the band is untouched.
+ *
+ * Three things about the arguments are worth stating, because each is a place
+ * the rtems-lwip convention and a radio disagree.
+ *
+ * `ipaddr` and friends are ip_addr_t, the dual-stack union, because LWIP_IPV6
+ * is 1 in this BSP's lwipopts.h.  netif_add() wants the ip4_addr_t inside it,
+ * and reading that out of a union tagged IPv6 would silently configure
+ * nonsense, so the type tag is checked rather than assumed.  NULL is allowed
+ * and means "DHCP will supply it".
+ *
+ * `mac_address` is accepted and not used.  On the Zynq it is an input: the
+ * driver programs the GEM with whatever the application chose.  A station's
+ * MAC is not the application's to choose -- it comes from eFuse, the WiFi
+ * libraries derive the interface addresses from it, and a netif claiming a
+ * different one would ARP for addresses the radio never accepts.  So the
+ * netif's hwaddr comes from the driver's get_mac, which is esp_wifi_get_mac,
+ * and an application that wants to know it reads netif->hwaddr afterwards.
+ *
+ * The return is zero for success, which is the weak default's contract and the
+ * opposite of the rest of rtems-lwip.
+ */
+int esp32c3_netif_add(
+  struct netif  *net_interface,
+  ip_addr_t     *ipaddr,
+  ip_addr_t     *netmask,
+  ip_addr_t     *gateway,
+  unsigned char *mac_address
+)
+{
+  struct netif *added;
+
+  (void) mac_address;
+
+  if ( !IP_IS_V4( ipaddr ) || !IP_IS_V4( netmask ) || !IP_IS_V4( gateway ) ) {
+    printk( "rtems-esp-netif: the station takes an IPv4 address; IPv6 comes\n"
+            "rtems-esp-netif: from SLAAC once the interface is up\n" );
+
+    return 1;
+  }
+
+  added = rtems_esp_netif_add(
+    net_interface,
+    &rtems_esp_netif_blob_driver,
+    ipaddr != NULL ? ip_2_ip4( ipaddr ) : NULL,
+    netmask != NULL ? ip_2_ip4( netmask ) : NULL,
+    gateway != NULL ? ip_2_ip4( gateway ) : NULL
+  );
+
+  if ( added == NULL ) {
+    return 1;
+  }
+
+  /*
+   * The station is the only interface this part has, so it is the default
+   * route whether or not it is up yet; without this every connect() outside
+   * the loopback network fails with ERR_RTE.  netif_set_up() is deliberately
+   * not called here -- that waits for WIFI_EVENT_STA_START, which is the
+   * moment the receive path can be installed.
+   */
+  netif_set_default( added );
+
+  return 0;
+}

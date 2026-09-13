@@ -148,6 +148,15 @@ typedef struct {
  * that drive its link state.  The address arguments are the usual lwIP ones
  * and may all be NULL, which is what to pass when DHCP is to supply them.
  *
+ * `netif` is the storage lwIP will use, and it must outlive the interface --
+ * lwIP keeps the pointer, it does not copy.  NULL asks this file for its own,
+ * which is what a caller that has no opinion should pass.  It is a parameter
+ * rather than always this file's static because rtems-lwip's start_networking()
+ * hands its caller's netif down through esp32c3_netif_add(), and an
+ * application that follows that convention -- checking netif_is_up() on the
+ * netif it passed, as tests/zynq-lwip does -- has to be given the one that was
+ * really added rather than a zeroed bystander.
+ *
  * tcpip_init() must already have been called -- this does not call it, because
  * whether the application or an rtems-lwip start_networking() owns that is the
  * application's decision and calling it twice is not harmless.
@@ -155,6 +164,7 @@ typedef struct {
  * Returns the netif, or NULL with the reason reported on the console.
  */
 struct netif *rtems_esp_netif_add(
+  struct netif                 *netif,
   const rtems_esp_netif_driver *driver,
   const ip4_addr_t             *ipaddr,
   const ip4_addr_t             *netmask,
@@ -191,6 +201,33 @@ const rtems_esp_netif_stats *rtems_esp_netif_get_stats( void );
 
 /* Print them, one per line, as `name value`. */
 void rtems_esp_netif_print_stats( void );
+
+/*
+ * rtems-lwip's hook, defined here so that linking this file overrides it.
+ *
+ * rtemslwip/esp32c3/netstart.c's start_networking() brings the stack up and
+ * then calls this to get an interface, because the C3 has no Ethernet
+ * controller and its only one is the radio, which rtems-lwip must not know
+ * about.  Its own definition is weak and does nothing but explain its absence.
+ *
+ * The prototype is repeated here rather than taken from a header because
+ * rtems-lwip does not declare it in netstart.h -- there is nothing there for
+ * an application to call.  It is declared at all so that a build of this file
+ * without liblwip on the link line still type-checks the override, which is
+ * the failure worth catching early: a signature that drifts from the weak
+ * definition would link cleanly and pass the wrong arguments.
+ *
+ * Returns zero on success, matching the weak default's contract, which is the
+ * opposite of everything else in rtems-lwip and is checked against the real
+ * source rather than remembered.
+ */
+int esp32c3_netif_add(
+  struct netif  *net_interface,
+  ip_addr_t     *ipaddr,
+  ip_addr_t     *netmask,
+  ip_addr_t     *gateway,
+  unsigned char *mac_address
+);
 
 #ifdef __cplusplus
 }
