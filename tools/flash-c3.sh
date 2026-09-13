@@ -1,6 +1,7 @@
 #!/bin/sh
 # Wait for an ESP32-C3 to appear, flash it, and open the console.
 #
+#   tools/flash-c3.sh stock        # known-good MicroPython, to prove the board
 #   tools/flash-c3.sh              # USB-console image (SuperMini, native USB)
 #   tools/flash-c3.sh uart         # UART-console image (bridge chip, or an
 #                                  # external USB-serial adapter on GPIO20/21)
@@ -17,9 +18,17 @@ ESPTOOL=${ESPTOOL:-/Users/sprice5/src/rtems-esphome/.venv/bin/esptool}
 SECONDS_TO_WAIT=${SECONDS_TO_WAIT:-300}
 
 case "${1:-usb}" in
-  uart) IMAGE=$SP/wifi-init-out/flash.raw;     WHICH="UART console" ;;
-  usb)  IMAGE=$SP/wifi-init-usb-out/flash.raw; WHICH="USB console" ;;
-  *)    IMAGE=$1;                              WHICH="$1" ;;
+  uart)  IMAGE=$SP/wifi-init-out/flash.raw;     WHICH="UART console" ;;
+  usb)   IMAGE=$SP/wifi-init-usb-out/flash.raw; WHICH="USB console" ;;
+  # A known-good third-party image, for proving the board and the whole
+  # flashing path before introducing ours.  Ours is direct-boot format --
+  # 0xaedb041d at offset 0, no bootloader, no partition table -- and has never
+  # run on real silicon, so a board that stays broken after flashing it cannot
+  # be told apart from one where direct boot simply does not work.  MicroPython
+  # is an ordinary esp_image (0xe9) with a bootloader, so it removes that
+  # ambiguity: if it runs, the board and the path are good.
+  stock) IMAGE=$SP/stock/mp-c3.bin;             WHICH="stock MicroPython" ;;
+  *)     IMAGE=$1;                              WHICH="$1" ;;
 esac
 
 [ -r "$IMAGE" ] || { echo "no image at $IMAGE" >&2; exit 2; }
