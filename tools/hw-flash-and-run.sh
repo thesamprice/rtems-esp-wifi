@@ -10,6 +10,22 @@
 # still needs esptool to be WRITTEN, at offset 0, which docs/esp32c3-bsp.md's
 # "no esptool" is easy to misread as saying otherwise.
 #
+# There is a third case beyond the two below: flashing over plain UART with an
+# external USB-to-serial adapter, which bypasses the board's own USB entirely.
+# The C3's ROM bootloader accepts firmware on U0RXD/U0TXD (GPIO20/21)
+# independently of the USB-Serial-JTAG peripheral, so a board whose USB does
+# not enumerate at all can still be programmed:
+#
+#     adapter TX  -> GPIO20 (U0RXD)
+#     adapter RX  -> GPIO21 (U0TXD)
+#     adapter GND -> GND
+#
+# Hold BOOT while powering on and the ROM listens on UART instead of USB.  The
+# adapter's own port is what this script then finds, and because the console is
+# UART0 in that arrangement the image to flash is the one built with
+# ESPRESSIF_USE_USB_CONSOLE = False -- examples/wifi-init/wifi-bsp.ini, not
+# wifi-bsp-usb.ini.  Console output comes back over the same two wires.
+#
 # And which USB device the board presents decides whether the console works at
 # all.  A board with a bridge chip (CP210x, CH34x, FTDI) speaks UART0, which is
 # what ESPRESSIF_USE_USB_CONSOLE=False selects.  A board wired only to the C3's
