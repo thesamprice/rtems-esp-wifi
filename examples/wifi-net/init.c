@@ -378,12 +378,20 @@ done:
   /*
    * Said in words as well as in the zero above, because a reader who sees
    * eb_taken == eb_released might otherwise take it for a result.  It holds
-   * vacuously: no frame arrived, so neither counter ever moved.
+   * vacuously: no frame reached this layer, so neither counter ever moved.
+   *
+   * The reason changed once QEMU's MAC model learned to inject frames, and the
+   * old wording -- "QEMU has no WiFi MAC, so no frame can arrive" -- is no
+   * longer true.  Frames do arrive now, and the MAC interrupt is delivered and
+   * serviced; they are dropped one layer above this file.
    */
   printf(
-    "\nrx_frames is 0 and must be: QEMU's esp32c3 has no WiFi MAC, so no\n"
-    "frame can arrive and the receive path did not execute.  eb_taken ==\n"
-    "eb_released above is therefore true without having tested anything.\n"
+    "\nrx_frames is 0, and the reason is no longer that nothing arrives.\n"
+    "QEMU's MAC model injects frames and the interrupt is serviced -- they\n"
+    "reach sta_input inside libnet80211 and are dropped there, correctly,\n"
+    "because this image never calls esp_wifi_connect() so net80211 has no\n"
+    "BSS a data frame could belong to.  So eb_taken == eb_released above is\n"
+    "still true without having tested anything.\n"
   );
 
   printf( "\n%d failure(s)\n", failures );
