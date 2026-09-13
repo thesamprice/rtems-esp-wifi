@@ -262,7 +262,25 @@ esp_err_t esp_wifi_init( const wifi_init_config_t *config )
     PHY_RF_CAL_FULL
   );
 
-  if ( phy_result != ESP_OK ) {
+  /*
+   * ESP_CAL_DATA_CHECK_FAIL is not a failure, and treating it as one was a
+   * bug here rather than a problem with the radio.
+   *
+   * register_chipv7_phy() returns it when the checksum over the *input*
+   * calibration data does not match -- which is exactly what happens on a
+   * first boot, because there is no saved calibration and this port has no
+   * NVS to have saved it in.  libphy then does a full calibration anyway and
+   * reports that it had to.  ESP-IDF's own esp_phy_load_cal_and_init() logs
+   * it at INFO and carries on (esp_phy/src/phy_init.c, "Saving new
+   * calibration data due to checksum failure").
+   *
+   * Anything else is a real failure.
+   */
+  if ( phy_result == ESP_CAL_DATA_CHECK_FAIL ) {
+    printk(
+      "rtems-esp-wifi: no saved calibration, so the PHY calibrated fully\n"
+    );
+  } else if ( phy_result != ESP_OK ) {
     printk( "rtems-esp-wifi: register_chipv7_phy failed (%d)\n", phy_result );
 
     return ESP_FAIL;

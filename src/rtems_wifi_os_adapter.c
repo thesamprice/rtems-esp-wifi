@@ -24,11 +24,13 @@
  * both ESP-IDF's expectations and RTEMS' primitives.
  *
  * 118 of the table's 128 entries are active on the ESP32-C3; the rest are
- * guarded out for other targets.  Of those 118, 50 map onto RTEMS primitives
- * and are implemented here.  The other 68 need components that are not built
- * yet -- 23 coexistence, 12 NVS, 10 PHY and clocks, 6 event groups, 5 ETS
- * timers, 3 logging, 2 power management -- and they are *named failures*
- * rather than empty stubs: each reports its own name and returns an error.
+ * guarded out for other targets.  Of those 118, 59 map onto RTEMS primitives
+ * and are implemented here -- including the five event groups and the five ETS
+ * timers, which have no RTEMS equivalent and are built out of pthreads and the
+ * timer server respectively.  The other 59 need components that are not built
+ * yet -- 23 coexistence, 12 NVS, 12 PHY, clocks and MAC, 7 interrupt plumbing,
+ * 3 logging, 2 power management -- and they are *named failures* rather than
+ * empty stubs: each reports its own name and returns an error.
  *
  * That choice is deliberate.  An empty stub returning zero makes the WiFi
  * stack fail somewhere far away, and the ESP-IDF failure modes for a missing
@@ -63,6 +65,25 @@
 /* ESP-IDF's convention for these entries. */
 #define ESP_OK   0
 #define ESP_FAIL (-1)
+
+/*
+ * pdTRUE and pdFALSE, not ESP_OK and ESP_FAIL.
+ *
+ * The entries that ESP-IDF implements with xQueueSend, xQueueReceive,
+ * xSemaphoreTake and friends return FreeRTOS status, where success is 1.  Half
+ * of this table is that shape and half is esp_err_t, where success is 0, and
+ * the two are exact opposites.
+ *
+ * Getting it backwards is not a crash.  esp_wifi_init_internal() returned
+ * ESP_ERR_WIFI_POST -- "failed to post the event to WiFi task" -- because
+ * every successful send reported failure.  A queue that works perfectly and
+ * claims to have failed is a good deal harder to find than one that does not
+ * work, so the two constants are named here rather than written as 0 and 1 at
+ * each site.
+ */
+#define RTEMS_WIFI_PD_TRUE  1
+#define RTEMS_WIFI_PD_FALSE 0
+
 
 /*
  * FreeRTOS numbers priorities with higher meaning more urgent and RTEMS the
@@ -256,13 +277,13 @@ static int32_t rtems_wifi_semphr_take( void *semphr, uint32_t block_time_tick )
     );
   }
 
-  return sc == RTEMS_SUCCESSFUL ? ESP_OK : ESP_FAIL;
+  return sc == RTEMS_SUCCESSFUL ? RTEMS_WIFI_PD_TRUE : RTEMS_WIFI_PD_FALSE;
 }
 
 static int32_t rtems_wifi_semphr_give( void *semphr )
 {
   return rtems_semaphore_release( (rtems_id) (uintptr_t) semphr )
-    == RTEMS_SUCCESSFUL ? ESP_OK : ESP_FAIL;
+    == RTEMS_SUCCESSFUL ? RTEMS_WIFI_PD_TRUE : RTEMS_WIFI_PD_FALSE;
 }
 
 /*
@@ -361,13 +382,13 @@ static int32_t rtems_wifi_mutex_lock( void *mutex )
     (rtems_id) (uintptr_t) mutex,
     RTEMS_WAIT,
     RTEMS_NO_TIMEOUT
-  ) == RTEMS_SUCCESSFUL ? ESP_OK : ESP_FAIL;
+  ) == RTEMS_SUCCESSFUL ? RTEMS_WIFI_PD_TRUE : RTEMS_WIFI_PD_FALSE;
 }
 
 static int32_t rtems_wifi_mutex_unlock( void *mutex )
 {
   return rtems_semaphore_release( (rtems_id) (uintptr_t) mutex )
-    == RTEMS_SUCCESSFUL ? ESP_OK : ESP_FAIL;
+    == RTEMS_SUCCESSFUL ? RTEMS_WIFI_PD_TRUE : RTEMS_WIFI_PD_FALSE;
 }
 
 /* === queues ============================================================ */
@@ -401,7 +422,7 @@ static int32_t rtems_wifi_queue_send_sized(
   (void) block_time_tick;
 
   if ( q == NULL ) {
-    return ESP_FAIL;
+    return RTEMS_WIFI_PD_FALSE;
   }
 
   /*
@@ -419,7 +440,7 @@ static int32_t rtems_wifi_queue_send_sized(
     sc = rtems_message_queue_send( q->id, item, q->item_size );
   }
 
-  return sc == RTEMS_SUCCESSFUL ? ESP_OK : ESP_FAIL;
+  return sc == RTEMS_SUCCESSFUL ? RTEMS_WIFI_PD_TRUE : RTEMS_WIFI_PD_FALSE;
 }
 
 static int32_t rtems_wifi_queue_send(
@@ -464,7 +485,7 @@ static int32_t rtems_wifi_queue_recv(
   rtems_status_code sc;
 
   if ( q == NULL ) {
-    return ESP_FAIL;
+    return RTEMS_WIFI_PD_FALSE;
   }
 
   if ( block_time_tick == OSI_FUNCS_TIME_BLOCKING ) {
@@ -478,7 +499,7 @@ static int32_t rtems_wifi_queue_recv(
       q->id, item, &received, RTEMS_WAIT, block_time_tick );
   }
 
-  return sc == RTEMS_SUCCESSFUL ? ESP_OK : ESP_FAIL;
+  return sc == RTEMS_SUCCESSFUL ? RTEMS_WIFI_PD_TRUE : RTEMS_WIFI_PD_FALSE;
 }
 
 static uint32_t rtems_wifi_queue_msg_waiting( void *queue )
@@ -527,14 +548,61 @@ static void rtems_wifi_queue_delete( void *queue )
   }
 }
 
+/*
+ * _wifi_create_queue does NOT return a queue handle, and returning one is a
+ * null dereference in the WiFi task about a second after the libraries start.
+ *
+ * ESP-IDF's wifi_create_queue() returns a wifi_static_queue_t (esp_private/
+ * wifi.h): { QueueHandle_t handle; void *storage; }.  The libraries keep that
+ * pointer, read ->handle out of it, and pass *the handle* to _queue_send and
+ * _queue_recv -- not the thing this function returned.
+ *
+ * Returning the rtems_wifi_queue directly therefore half-works: the blob reads
+ * its first word, which is the rtems_id, and hands that back as the queue.
+ * _queue_recv then dereferences an object id as a pointer.  It faulted at
+ * mcause 0x5 with a5 = 0x22010002, which is an id rather than an address, and
+ * that value is the only reason the cause was findable.
+ *
+ * storage stays null: it exists so FreeRTOS can be handed statically allocated
+ * queue memory, and RTEMS' message queues own theirs.
+ */
+typedef struct {
+  void *handle;
+  void *storage;
+} rtems_wifi_static_queue;
+
 static void *rtems_wifi_create_queue( int queue_len, int item_size )
 {
-  return rtems_wifi_queue_create( (uint32_t) queue_len, (uint32_t) item_size );
+  rtems_wifi_static_queue *sq = malloc( sizeof( *sq ) );
+
+  if ( sq == NULL ) {
+    return NULL;
+  }
+
+  sq->handle  = rtems_wifi_queue_create( (uint32_t) queue_len,
+                                         (uint32_t) item_size );
+  sq->storage = NULL;
+
+  if ( sq->handle == NULL ) {
+    free( sq );
+
+    return NULL;
+  }
+
+  return sq;
 }
 
 static void rtems_wifi_delete_queue( void *queue )
 {
-  rtems_wifi_queue_delete( queue );
+  rtems_wifi_static_queue *sq = queue;
+
+  if ( sq == NULL ) {
+    return;
+  }
+
+  /* The wrapper this points at, then the wifi_static_queue_t itself. */
+  rtems_wifi_queue_delete( sq->handle );
+  free( sq );
 }
 
 /* === tasks ============================================================= */
@@ -720,6 +788,419 @@ static int rtems_wifi_get_random( uint8_t *buf, size_t len )
   return getentropy( buf, len ) == 0 ? ESP_OK : ESP_FAIL;
 }
 
+/* === event groups ====================================================== */
+
+/*
+ * A FreeRTOS event group is one shared bit mask with several waiters, each
+ * blocked on its own combination of bits and its own "all of" or "any of"
+ * rule.  RTEMS' rtems_event_send/receive look like the same thing and are
+ * not: their bits belong to one task, so a set that has to wake three
+ * waiters has nowhere to go.  A mutex and a condition variable is the
+ * construct that actually matches, and pthreads are already in use here for
+ * the per-thread semaphore key.
+ *
+ * Neither set_bits nor clear_bits may be called from an ISR: they take a
+ * pthread mutex.  ESP-IDF has a separate xEventGroupSetBitsFromISR for that
+ * case and this table has no entry for it, so no caller should need to.
+ */
+typedef struct {
+  pthread_mutex_t mutex;
+  pthread_cond_t  cond;
+  uint32_t        bits;
+} rtems_wifi_event_group;
+
+static void *rtems_wifi_event_group_create( void )
+{
+  rtems_wifi_event_group *g = malloc( sizeof( *g ) );
+  pthread_condattr_t      attr;
+
+  if ( g == NULL ) {
+    return NULL;
+  }
+
+  g->bits = 0;
+  pthread_mutex_init( &g->mutex, NULL );
+
+  /*
+   * CLOCK_MONOTONIC for the wait deadlines.  The default is CLOCK_REALTIME,
+   * which this port moves when SNTP sets the time, and a step backwards there
+   * would turn a 100 ms wait into a long one.
+   */
+  pthread_condattr_init( &attr );
+  pthread_condattr_setclock( &attr, CLOCK_MONOTONIC );
+  pthread_cond_init( &g->cond, &attr );
+  pthread_condattr_destroy( &attr );
+
+  return g;
+}
+
+static void rtems_wifi_event_group_delete( void *event )
+{
+  rtems_wifi_event_group *g = event;
+
+  if ( g == NULL ) {
+    return;
+  }
+
+  /*
+   * FreeRTOS' vEventGroupDelete unblocks the waiters first.  There is no way
+   * to do that here and then free the memory they are about to touch, so a
+   * group with waiters must not be deleted; the callers delete these while
+   * tearing down, after the tasks that wait on them are gone.
+   */
+  pthread_cond_destroy( &g->cond );
+  pthread_mutex_destroy( &g->mutex );
+  free( g );
+}
+
+static uint32_t rtems_wifi_event_group_set_bits( void *event, uint32_t bits )
+{
+  rtems_wifi_event_group *g = event;
+  uint32_t                value;
+
+  if ( g == NULL ) {
+    return 0;
+  }
+
+  pthread_mutex_lock( &g->mutex );
+  g->bits |= bits;
+  value = g->bits;
+
+  /*
+   * Broadcast, not signal: the waiters are each waiting for a different
+   * combination, so waking only one can wake the one this set did not
+   * satisfy and leave a satisfied waiter asleep.
+   */
+  pthread_cond_broadcast( &g->cond );
+  pthread_mutex_unlock( &g->mutex );
+
+  /*
+   * The value as of the set.  FreeRTOS returns it as of the *return*, by
+   * which point a waiter woken with clear-on-exit may already have taken its
+   * bits back out.  Nothing in the WiFi libraries reads this return value,
+   * and reporting the mask that was actually set is the more useful of the
+   * two if something ever does.
+   */
+  return value;
+}
+
+static uint32_t rtems_wifi_event_group_clear_bits( void *event, uint32_t bits )
+{
+  rtems_wifi_event_group *g = event;
+  uint32_t                value;
+
+  if ( g == NULL ) {
+    return 0;
+  }
+
+  /* The value *before* the clear, which is what xEventGroupClearBits
+   * returns.  No broadcast: clearing bits cannot satisfy a waiter. */
+  pthread_mutex_lock( &g->mutex );
+  value = g->bits;
+  g->bits &= ~bits;
+  pthread_mutex_unlock( &g->mutex );
+
+  return value;
+}
+
+static uint32_t rtems_wifi_event_group_wait_bits(
+  void     *event,
+  uint32_t  bits_to_wait_for,
+  int       clear_on_exit,
+  int       wait_for_all_bits,
+  uint32_t  block_time_tick
+)
+{
+  rtems_wifi_event_group *g = event;
+  struct timespec         deadline;
+  uint32_t                value;
+  bool                    satisfied;
+  bool                    timed_out = false;
+
+  if ( g == NULL ) {
+    return 0;
+  }
+
+  /*
+   * Waiting for no bits can never be satisfied by the "any of" rule and is
+   * always satisfied by "all of".  FreeRTOS asserts on it; returning the
+   * current mask is the one answer that cannot hang.
+   */
+  if ( bits_to_wait_for == 0 ) {
+    return rtems_wifi_event_group_clear_bits( event, 0 );
+  }
+
+  if ( block_time_tick != OSI_FUNCS_TIME_BLOCKING && block_time_tick != 0 ) {
+    uint64_t ns = (uint64_t) block_time_tick
+      * rtems_configuration_get_microseconds_per_tick() * 1000;
+
+    clock_gettime( CLOCK_MONOTONIC, &deadline );
+    deadline.tv_sec += (time_t) ( ns / 1000000000ULL );
+    deadline.tv_nsec += (long) ( ns % 1000000000ULL );
+
+    if ( deadline.tv_nsec >= 1000000000L ) {
+      deadline.tv_nsec -= 1000000000L;
+      deadline.tv_sec += 1;
+    }
+  }
+
+  pthread_mutex_lock( &g->mutex );
+
+  for ( ;; ) {
+    value = g->bits;
+
+    /*
+     * "All of" is every requested bit present, "any of" is at least one.  The
+     * returned value is the mask as it was when the wait was satisfied, before
+     * clear-on-exit takes the bits out again -- a caller that is told only the
+     * cleared mask cannot tell which of several bits woke it.
+     */
+    if ( wait_for_all_bits ) {
+      satisfied = ( value & bits_to_wait_for ) == bits_to_wait_for;
+    } else {
+      satisfied = ( value & bits_to_wait_for ) != 0;
+    }
+
+    if ( satisfied ) {
+      if ( clear_on_exit ) {
+        g->bits &= ~bits_to_wait_for;
+      }
+
+      break;
+    }
+
+    /*
+     * Zero is a poll rather than "no timeout", the same inversion the
+     * semaphore take has, and a wait that has already timed out still gets
+     * one last look at the mask above before it gives up.
+     */
+    if ( block_time_tick == 0 || timed_out ) {
+      break;
+    }
+
+    if ( block_time_tick == OSI_FUNCS_TIME_BLOCKING ) {
+      pthread_cond_wait( &g->cond, &g->mutex );
+    } else {
+      timed_out =
+        pthread_cond_timedwait( &g->cond, &g->mutex, &deadline ) == ETIMEDOUT;
+    }
+  }
+
+  pthread_mutex_unlock( &g->mutex );
+
+  return value;
+}
+
+/* === ETS timers ======================================================== */
+
+/*
+ * ETS timers are the ROM's timers and the caller owns the storage: it passes
+ * a pointer to its own ETSTimer, five 32-bit words, and expects setfn to
+ * initialise it and done to release it.  So the RTEMS state has to live
+ * inside those five words rather than beside them, and the magic is what
+ * tells an initialised one from whatever the caller's memory held before.
+ */
+#define RTEMS_WIFI_ETS_TIMER_MAGIC 0x5746
+
+typedef struct {
+  rtems_id   id;
+  void     (*func)( void *arg );
+  void      *arg;
+  uint32_t   interval;
+  uint16_t   magic;
+  bool       repeat;
+} rtems_wifi_ets_timer;
+
+RTEMS_STATIC_ASSERT(
+  sizeof( rtems_wifi_ets_timer ) <= 5 * sizeof( uint32_t ),
+  ets_timer_fits_in_the_callers_ETSTimer
+);
+
+/*
+ * ESP-IDF dispatches these from the esp_timer task at FreeRTOS priority 22,
+ * one below the WiFi task's 23, and the callbacks rely on being in a task:
+ * they take mutexes and post to queues.  So the RTEMS timer *server* runs
+ * them, not the clock tick's interrupt context, and its priority is inverted
+ * the same way rtems_wifi_task_create inverts -- higher FreeRTOS number,
+ * lower RTEMS number.
+ */
+#define RTEMS_WIFI_ETS_TIMER_PRIORITY ( RTEMS_WIFI_PRIORITY_MAX - 22 )
+
+static pthread_once_t rtems_wifi_timer_server_once = PTHREAD_ONCE_INIT;
+
+static void rtems_wifi_timer_server_start( void )
+{
+  rtems_status_code sc = rtems_timer_initiate_server(
+    RTEMS_WIFI_ETS_TIMER_PRIORITY,
+    RTEMS_MINIMUM_STACK_SIZE * 4,
+    RTEMS_DEFAULT_ATTRIBUTES
+  );
+
+  /*
+   * RTEMS_INCORRECT_STATE means the application started it already, which is
+   * fine -- there is one server and it is shared.  Anything else is a
+   * configuration problem (no task or no timer left) that would otherwise
+   * present as a WiFi stack whose timeouts never fire.
+   */
+  if ( sc != RTEMS_SUCCESSFUL && sc != RTEMS_INCORRECT_STATE ) {
+    printk(
+      "wifi.osi: the timer server would not start (%s)\n",
+      rtems_status_text( sc )
+    );
+  }
+}
+
+/*
+ * Microseconds to ticks, rounded *up* and never to zero.  A sub-tick interval
+ * is the case that matters: rounding down gives 0, which rtems_timer_*_after
+ * rejects, and a periodic timer that re-armed with 0 would either stop or
+ * fire every tick forever.  So the floor is one tick -- with the usual 10 ms
+ * tick, the ROM's 640 us minimum becomes 10 ms.  That is a real loss of
+ * resolution and the reason a short WiFi timeout may be late, but late is
+ * recoverable and a timer that fires continuously is not.
+ */
+static uint32_t rtems_wifi_us_to_ticks( uint64_t us )
+{
+  uint64_t per_tick = rtems_configuration_get_microseconds_per_tick();
+  uint64_t ticks = ( us + per_tick - 1 ) / per_tick;
+
+  if ( ticks == 0 ) {
+    ticks = 1;
+  } else if ( ticks > 0xffffffffU ) {
+    ticks = 0xffffffffU;
+  }
+
+  return (uint32_t) ticks;
+}
+
+static void rtems_wifi_timer_tsr( rtems_id id, void *arg )
+{
+  rtems_wifi_ets_timer *t = arg;
+
+  (void) id;
+
+  if ( t == NULL || t->magic != RTEMS_WIFI_ETS_TIMER_MAGIC ) {
+    return;
+  }
+
+  /*
+   * Re-armed before the callback rather than after, so that a callback which
+   * disarms or frees its own timer -- which the WiFi libraries do -- wins
+   * instead of being undone by a re-arm behind it.
+   */
+  if ( t->repeat ) {
+    rtems_timer_server_fire_after(
+      t->id, t->interval, rtems_wifi_timer_tsr, t );
+  }
+
+  if ( t->func != NULL ) {
+    t->func( t->arg );
+  }
+}
+
+static void rtems_wifi_timer_setfn(
+  void *ptimer, void *pfunction, void *parg )
+{
+  rtems_wifi_ets_timer *t = ptimer;
+
+  if ( t == NULL ) {
+    return;
+  }
+
+  /*
+   * setfn is the constructor, and it is also called again on a timer that is
+   * already live to change the callback.  The magic is what separates the two:
+   * creating a second RTEMS timer for the same ETSTimer would leak the first
+   * and leave it firing.
+   */
+  if ( t->magic != RTEMS_WIFI_ETS_TIMER_MAGIC ) {
+    rtems_id id = RTEMS_INVALID_ID;
+
+    pthread_once( &rtems_wifi_timer_server_once, rtems_wifi_timer_server_start );
+
+    if ( rtems_timer_create(
+           rtems_build_name( 'W', 'F', 'T', 'M' ),
+           &id
+         ) != RTEMS_SUCCESSFUL ) {
+      printk( "wifi.osi: out of RTEMS timers, CONFIGURE_MAXIMUM_TIMERS\n" );
+      return;
+    }
+
+    t->id = id;
+    t->interval = 1;
+    t->repeat = false;
+    t->magic = RTEMS_WIFI_ETS_TIMER_MAGIC;
+  } else {
+    rtems_timer_cancel( t->id );
+    t->repeat = false;
+  }
+
+  t->func = pfunction;
+  t->arg = parg;
+}
+
+static void rtems_wifi_timer_arm_ticks(
+  rtems_wifi_ets_timer *t, uint32_t ticks, bool repeat )
+{
+  if ( t == NULL || t->magic != RTEMS_WIFI_ETS_TIMER_MAGIC ) {
+    /* Armed before setfn, so there is no timer and no callback to run. */
+    printk( "wifi.osi: an ETS timer was armed before _timer_setfn\n" );
+    return;
+  }
+
+  t->interval = ticks;
+  t->repeat = repeat;
+
+  rtems_timer_server_fire_after( t->id, ticks, rtems_wifi_timer_tsr, t );
+}
+
+static void rtems_wifi_timer_arm( void *timer, uint32_t tmout, bool repeat )
+{
+  /* ets_timer_arm takes milliseconds; only arm_us takes microseconds. */
+  rtems_wifi_timer_arm_ticks(
+    timer, rtems_wifi_us_to_ticks( (uint64_t) tmout * 1000 ), repeat );
+}
+
+static void rtems_wifi_timer_arm_us( void *ptimer, uint32_t us, bool repeat )
+{
+  rtems_wifi_timer_arm_ticks( ptimer, rtems_wifi_us_to_ticks( us ), repeat );
+}
+
+static void rtems_wifi_timer_disarm( void *timer )
+{
+  rtems_wifi_ets_timer *t = timer;
+
+  if ( t == NULL || t->magic != RTEMS_WIFI_ETS_TIMER_MAGIC ) {
+    return;
+  }
+
+  /*
+   * repeat cleared as well as cancelled: a periodic timer whose callback is
+   * running on the server right now has already re-armed itself, and
+   * cancelling alone would let the next period through.
+   */
+  t->repeat = false;
+  rtems_timer_cancel( t->id );
+}
+
+static void rtems_wifi_timer_done( void *ptimer )
+{
+  rtems_wifi_ets_timer *t = ptimer;
+
+  if ( t == NULL || t->magic != RTEMS_WIFI_ETS_TIMER_MAGIC ) {
+    return;
+  }
+
+  /* The destructor.  The magic goes first so that a use after this point is
+   * an ignored call rather than a stale rtems_id. */
+  t->magic = 0;
+  t->repeat = false;
+  rtems_timer_cancel( t->id );
+  rtems_timer_delete( t->id );
+  t->func = NULL;
+  t->arg = NULL;
+}
+
 /* === not implemented yet =============================================== */
 
 /*
@@ -758,46 +1239,6 @@ static void rtems_wifi_stub_set_isr( int32_t n, void *f, void *arg )
   (void) arg;
   RTEMS_WIFI_UNIMPLEMENTED( "a component that is not built yet" );
 }
-
-static void *rtems_wifi_stub_event_group_create( void )
-{
-  RTEMS_WIFI_UNIMPLEMENTED( "event groups" );
-  return NULL;
-}
-
-static void rtems_wifi_stub_event_group_delete( void *event )
-{
-  (void) event;
-  RTEMS_WIFI_UNIMPLEMENTED( "event groups" );
-}
-
-static uint32_t rtems_wifi_stub_event_group_set_bits( void *event, uint32_t bits )
-{
-  (void) event;
-  (void) bits;
-  RTEMS_WIFI_UNIMPLEMENTED( "event groups" );
-  return 0;
-}
-
-static uint32_t rtems_wifi_stub_event_group_clear_bits( void *event, uint32_t bits )
-{
-  (void) event;
-  (void) bits;
-  RTEMS_WIFI_UNIMPLEMENTED( "event groups" );
-  return 0;
-}
-
-static uint32_t rtems_wifi_stub_event_group_wait_bits( void *event, uint32_t bits_to_wait_for, int clear_on_exit, int wait_for_all_bits, uint32_t block_time_tick )
-{
-  (void) event;
-  (void) bits_to_wait_for;
-  (void) clear_on_exit;
-  (void) wait_for_all_bits;
-  (void) block_time_tick;
-  RTEMS_WIFI_UNIMPLEMENTED( "event groups" );
-  return 0;
-}
-
 
 static void rtems_wifi_stub_dport_access_stall_other_cpu_start_wrap( void )
 {
@@ -842,42 +1283,6 @@ static int rtems_wifi_stub_read_mac( uint8_t* mac, unsigned int type )
   (void) type;
   RTEMS_WIFI_UNIMPLEMENTED( "esp_hw_support" );
   return ESP_FAIL;
-}
-
-static void rtems_wifi_stub_timer_arm( void *timer, uint32_t tmout, bool repeat )
-{
-  (void) timer;
-  (void) tmout;
-  (void) repeat;
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_timer" );
-}
-
-static void rtems_wifi_stub_timer_disarm( void *timer )
-{
-  (void) timer;
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_timer" );
-}
-
-static void rtems_wifi_stub_timer_done( void *ptimer )
-{
-  (void) ptimer;
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_timer" );
-}
-
-static void rtems_wifi_stub_timer_setfn( void *ptimer, void *pfunction, void *parg )
-{
-  (void) ptimer;
-  (void) pfunction;
-  (void) parg;
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_timer" );
-}
-
-static void rtems_wifi_stub_timer_arm_us( void *ptimer, uint32_t us, bool repeat )
-{
-  (void) ptimer;
-  (void) us;
-  (void) repeat;
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_timer" );
 }
 
 static void rtems_wifi_stub_wifi_reset_mac( void )
@@ -1239,11 +1644,11 @@ wifi_osi_funcs_t g_wifi_osi_funcs = {
   ._queue_send_to_front = rtems_wifi_queue_send_to_front,
   ._queue_recv = rtems_wifi_queue_recv,
   ._queue_msg_waiting = rtems_wifi_queue_msg_waiting,
-  ._event_group_create = rtems_wifi_stub_event_group_create,
-  ._event_group_delete = rtems_wifi_stub_event_group_delete,
-  ._event_group_set_bits = rtems_wifi_stub_event_group_set_bits,
-  ._event_group_clear_bits = rtems_wifi_stub_event_group_clear_bits,
-  ._event_group_wait_bits = rtems_wifi_stub_event_group_wait_bits,
+  ._event_group_create = rtems_wifi_event_group_create,
+  ._event_group_delete = rtems_wifi_event_group_delete,
+  ._event_group_set_bits = rtems_wifi_event_group_set_bits,
+  ._event_group_clear_bits = rtems_wifi_event_group_clear_bits,
+  ._event_group_wait_bits = rtems_wifi_event_group_wait_bits,
   ._task_create_pinned_to_core = rtems_wifi_task_create_pinned_to_core,
   ._task_create = rtems_wifi_task_create,
   ._task_delete = rtems_wifi_task_delete,
@@ -1264,11 +1669,11 @@ wifi_osi_funcs_t g_wifi_osi_funcs = {
   ._phy_enable = rtems_wifi_stub_phy_enable,
   ._phy_update_country_info = rtems_wifi_stub_phy_update_country_info,
   ._read_mac = rtems_wifi_stub_read_mac,
-  ._timer_arm = rtems_wifi_stub_timer_arm,
-  ._timer_disarm = rtems_wifi_stub_timer_disarm,
-  ._timer_done = rtems_wifi_stub_timer_done,
-  ._timer_setfn = rtems_wifi_stub_timer_setfn,
-  ._timer_arm_us = rtems_wifi_stub_timer_arm_us,
+  ._timer_arm = rtems_wifi_timer_arm,
+  ._timer_disarm = rtems_wifi_timer_disarm,
+  ._timer_done = rtems_wifi_timer_done,
+  ._timer_setfn = rtems_wifi_timer_setfn,
+  ._timer_arm_us = rtems_wifi_timer_arm_us,
   ._wifi_reset_mac = rtems_wifi_stub_wifi_reset_mac,
   ._wifi_clock_enable = rtems_wifi_stub_wifi_clock_enable,
   ._wifi_clock_disable = rtems_wifi_stub_wifi_clock_disable,
