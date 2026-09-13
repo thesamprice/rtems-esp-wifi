@@ -1201,6 +1201,212 @@ static void rtems_wifi_timer_done( void *ptimer )
   t->arg = NULL;
 }
 
+/* === the chip itself ==================================================== */
+
+/*
+ * These were named failures until the libraries were run far enough to call
+ * them.  That is what the named-failure stubs are for: rather than guessing
+ * which of the 68 the station path needs, esp_wifi_init() and esp_wifi_start()
+ * printed the list.  Every one implemented here appeared in that output.
+ *
+ * They are register work that ESP-IDF puts in esp_hw_support, which this port
+ * does not build.  The registers come from the C3's own headers in
+ * esp-hal-3rdparty rather than from memory; each is named below.
+ */
+
+/* soc/esp32c3/register/soc/reg_base.h and syscon_reg.h */
+#define RTEMS_WIFI_SYSCON_BASE        0x60026000u
+#define RTEMS_WIFI_CLK_EN_REG         ( RTEMS_WIFI_SYSCON_BASE + 0x014u )
+#define RTEMS_WIFI_RST_EN_REG         ( RTEMS_WIFI_SYSCON_BASE + 0x018u )
+#define RTEMS_WIFI_WIFIMAC_RST        ( 1u << 2 )   /* SYSTEM_WIFIMAC_RST */
+
+/* soc/esp32c3/register/soc/efuse_reg.h */
+#define RTEMS_WIFI_EFUSE_BASE         0x60008800u
+#define RTEMS_WIFI_EFUSE_MAC0_REG     ( RTEMS_WIFI_EFUSE_BASE + 0x44u )
+#define RTEMS_WIFI_EFUSE_MAC1_REG     ( RTEMS_WIFI_EFUSE_BASE + 0x48u )
+
+static inline uint32_t rtems_wifi_reg_read( uint32_t addr )
+{
+  return *(volatile uint32_t *) (uintptr_t) addr;
+}
+
+static inline void rtems_wifi_reg_write( uint32_t addr, uint32_t value )
+{
+  *(volatile uint32_t *) (uintptr_t) addr = value;
+}
+
+static bool rtems_wifi_env_is_chip( void )
+{
+  /*
+   * True means real silicon.  ESP-IDF returns false only under
+   * CONFIG_IDF_ENV_FPGA, for pre-production bring-up on an FPGA where the
+   * clocks differ; libphy uses it to pick timing constants.  Anything running
+   * this port is a real part -- QEMU included, since it models the part and
+   * not the FPGA.
+   */
+  return true;
+}
+
+static void rtems_wifi_clock_enable( void )
+{
+  /*
+   * SYSTEM_WIFI_CLK_WIFI_EN_M is genuinely zero on the ESP32-C3.
+   * clk_gate_ll.h defines it as (V << S) with V = 0x0, so ESP-IDF's
+   * periph_ll_wifi_module_enable_clk_clear_rst() sets no bits either -- the
+   * WiFi clock is not separately gated on this part.  The read-modify-write is
+   * kept so the shape matches the other chips and so this does not read as an
+   * oversight.
+   */
+  rtems_wifi_reg_write(
+    RTEMS_WIFI_CLK_EN_REG,
+    rtems_wifi_reg_read( RTEMS_WIFI_CLK_EN_REG ) | 0u
+  );
+}
+
+static void rtems_wifi_clock_disable( void )
+{
+  rtems_wifi_reg_write(
+    RTEMS_WIFI_CLK_EN_REG,
+    rtems_wifi_reg_read( RTEMS_WIFI_CLK_EN_REG ) & ~0u
+  );
+}
+
+static void rtems_wifi_reset_mac( void )
+{
+  uint32_t reg = rtems_wifi_reg_read( RTEMS_WIFI_RST_EN_REG );
+
+  /* periph_module_reset(PERIPH_WIFI_MODULE): assert then release. */
+  rtems_wifi_reg_write( RTEMS_WIFI_RST_EN_REG, reg | RTEMS_WIFI_WIFIMAC_RST );
+  rtems_wifi_reg_write( RTEMS_WIFI_RST_EN_REG, reg & ~RTEMS_WIFI_WIFIMAC_RST );
+}
+
+/* In libphy; declared here because esp_private/phy.h wants _lock_t. */
+extern void phy_wakeup_init( void );
+extern void phy_close_rf( void );
+extern void phy_wifi_enable_set( uint8_t enable );
+
+static void rtems_wifi_phy_enable( void )
+{
+  phy_wakeup_init();
+  phy_wifi_enable_set( 1 );
+}
+
+static void rtems_wifi_phy_disable( void )
+{
+  phy_wifi_enable_set( 0 );
+  phy_close_rf();
+}
+
+static int rtems_wifi_read_mac( uint8_t *mac, unsigned int type )
+{
+  uint32_t mac0;
+  uint32_t mac1;
+
+  if ( mac == NULL ) {
+    return ESP_FAIL;
+  }
+
+  mac0 = rtems_wifi_reg_read( RTEMS_WIFI_EFUSE_MAC0_REG );
+  mac1 = rtems_wifi_reg_read( RTEMS_WIFI_EFUSE_MAC1_REG );
+
+  /*
+   * mac[0] is the MOST significant byte, which is the opposite of how the two
+   * eFuse words are laid out -- MAC_1 holds the high 16 bits and MAC_0 the low
+   * 32.  esp_hw_support/mac_addr.c states the order where it reassembles them
+   * for the CRC check: mac_high = mac[0] << 8 | mac[1].
+   *
+   * Getting this backwards yields a valid-looking address that no access point
+   * will ever answer, so it is written out byte by byte rather than memcpy'd.
+   */
+  mac[ 0 ] = (uint8_t) ( ( mac1 >> 8 ) & 0xffu );
+  mac[ 1 ] = (uint8_t) ( mac1 & 0xffu );
+  mac[ 2 ] = (uint8_t) ( ( mac0 >> 24 ) & 0xffu );
+  mac[ 3 ] = (uint8_t) ( ( mac0 >> 16 ) & 0xffu );
+  mac[ 4 ] = (uint8_t) ( ( mac0 >> 8 ) & 0xffu );
+  mac[ 5 ] = (uint8_t) ( mac0 & 0xffu );
+
+  /*
+   * Type 0 is the station address, 1 the soft-AP's.  ESP-IDF derives the AP
+   * address from the base rather than storing a second one; the universe
+   * offset is 1.  Anything else is a radio this port does not have.
+   */
+  if ( type == 1 ) {
+    mac[ 5 ] += 1;
+  } else if ( type != 0 ) {
+    RTEMS_WIFI_UNIMPLEMENTED( "a MAC type other than station or soft-AP" );
+
+    return ESP_FAIL;
+  }
+
+  return ESP_OK;
+}
+
+/* === coexistence, which there is nothing to coexist with ================ */
+
+/*
+ * The ESP32-C3 has one radio shared between WiFi and Bluetooth, and these
+ * entries are how the WiFi side asks for it.  This port builds no Bluetooth,
+ * so WiFi always has the radio and the honest implementation is to say yes.
+ *
+ * Deliberately not named failures.  A named failure is right where the answer
+ * is unknown; here it is known, and reporting "not implemented" every time the
+ * libraries check for a peer that cannot exist would be noise that hides the
+ * entries that do still matter.
+ */
+static int rtems_wifi_coex_init( void )
+{
+  return ESP_OK;
+}
+
+static void rtems_wifi_coex_deinit( void )
+{
+}
+
+static int rtems_wifi_coex_enable( void )
+{
+  return ESP_OK;
+}
+
+static void rtems_wifi_coex_disable( void )
+{
+}
+
+static int rtems_wifi_coex_register_start_cb( int ( *cb )( void ) )
+{
+  (void) cb;
+
+  /*
+   * The callback is how coexistence would tell WiFi it may start a slot.  With
+   * no competing radio there is nothing to schedule around, so it is never
+   * called and reporting success is accurate rather than a shortcut.
+   */
+  return ESP_OK;
+}
+
+static int rtems_wifi_coex_schm_register_cb( int type, int ( *cb )( int ) )
+{
+  (void) type;
+  (void) cb;
+
+  return ESP_OK;
+}
+
+/* === power management, which is switched off =========================== */
+
+/*
+ * ESP-IDF's are already empty unless CONFIG_PM_ENABLE, and this port does not
+ * build power management at all -- see the file comment on esp_wifi_init().
+ * So an empty body is what ESP-IDF compiles too, not a stub standing in for
+ * one.
+ */
+static void rtems_wifi_pm_sleep_lock_acquire( void )
+{
+}
+
+static void rtems_wifi_pm_sleep_lock_release( void )
+{
+}
+
 /* === not implemented yet =============================================== */
 
 /*
@@ -1209,12 +1415,6 @@ static void rtems_wifi_timer_done( void *ptimer )
  * report once and return a failure; the comment at the top of this file says
  * why that is better than returning zero.
  */
-
-static bool rtems_wifi_stub_env_is_chip( void )
-{
-  RTEMS_WIFI_UNIMPLEMENTED( "a component that is not built yet" );
-  return false;
-}
 
 static void rtems_wifi_stub_set_intr( int32_t cpu_no, uint32_t intr_source, uint32_t intr_num, int32_t intr_prio )
 {
@@ -1250,54 +1450,11 @@ static void rtems_wifi_stub_dport_access_stall_other_cpu_end_wrap( void )
   RTEMS_WIFI_UNIMPLEMENTED( "esp_hw_support" );
 }
 
-static void rtems_wifi_stub_wifi_pm_sleep_lock_acquire( void )
-{
-  RTEMS_WIFI_UNIMPLEMENTED( "power management" );
-}
-
-static void rtems_wifi_stub_wifi_pm_sleep_lock_release( void )
-{
-  RTEMS_WIFI_UNIMPLEMENTED( "power management" );
-}
-
-static void rtems_wifi_stub_phy_disable( void )
-{
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_hw_support" );
-}
-
-static void rtems_wifi_stub_phy_enable( void )
-{
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_hw_support" );
-}
-
 static int rtems_wifi_stub_phy_update_country_info( const char* country )
 {
   (void) country;
   RTEMS_WIFI_UNIMPLEMENTED( "esp_hw_support" );
   return ESP_FAIL;
-}
-
-static int rtems_wifi_stub_read_mac( uint8_t* mac, unsigned int type )
-{
-  (void) mac;
-  (void) type;
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_hw_support" );
-  return ESP_FAIL;
-}
-
-static void rtems_wifi_stub_wifi_reset_mac( void )
-{
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_hw_support" );
-}
-
-static void rtems_wifi_stub_wifi_clock_enable( void )
-{
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_hw_support" );
-}
-
-static void rtems_wifi_stub_wifi_clock_disable( void )
-{
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_hw_support" );
 }
 
 static void rtems_wifi_stub_wifi_rtc_enable_iso( void )
@@ -1449,28 +1606,6 @@ static uint32_t rtems_wifi_stub_log_timestamp( void )
   return 0;
 }
 
-static int rtems_wifi_stub_coex_init( void )
-{
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_coex" );
-  return ESP_FAIL;
-}
-
-static void rtems_wifi_stub_coex_deinit( void )
-{
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_coex" );
-}
-
-static int rtems_wifi_stub_coex_enable( void )
-{
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_coex" );
-  return ESP_FAIL;
-}
-
-static void rtems_wifi_stub_coex_disable( void )
-{
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_coex" );
-}
-
 static uint32_t rtems_wifi_stub_coex_status_get( void )
 {
   RTEMS_WIFI_UNIMPLEMENTED( "esp_coex" );
@@ -1569,20 +1704,6 @@ static int rtems_wifi_stub_coex_schm_process_restart( void )
   return ESP_FAIL;
 }
 
-static int rtems_wifi_stub_coex_schm_register_cb( int, int (* cb)(int) )
-{
-  (void) cb;
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_coex" );
-  return ESP_FAIL;
-}
-
-static int rtems_wifi_stub_coex_register_start_cb( int (* cb)(void) )
-{
-  (void) cb;
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_coex" );
-  return ESP_FAIL;
-}
-
 static int rtems_wifi_stub_coex_schm_flexible_period_set( uint8_t )
 {
   RTEMS_WIFI_UNIMPLEMENTED( "esp_coex" );
@@ -1614,7 +1735,7 @@ static void *rtems_wifi_stub_coex_schm_get_phase_by_idx( int )
  */
 wifi_osi_funcs_t g_wifi_osi_funcs = {
   ._version = ESP_WIFI_OS_ADAPTER_VERSION,
-  ._env_is_chip = rtems_wifi_stub_env_is_chip,
+  ._env_is_chip = rtems_wifi_env_is_chip,
   ._set_intr = rtems_wifi_stub_set_intr,
   ._clear_intr = rtems_wifi_stub_clear_intr,
   ._set_isr = rtems_wifi_stub_set_isr,
@@ -1663,20 +1784,20 @@ wifi_osi_funcs_t g_wifi_osi_funcs = {
   ._rand = rtems_wifi_rand,
   ._dport_access_stall_other_cpu_start_wrap = rtems_wifi_stub_dport_access_stall_other_cpu_start_wrap,
   ._dport_access_stall_other_cpu_end_wrap = rtems_wifi_stub_dport_access_stall_other_cpu_end_wrap,
-  ._wifi_pm_sleep_lock_acquire = rtems_wifi_stub_wifi_pm_sleep_lock_acquire,
-  ._wifi_pm_sleep_lock_release = rtems_wifi_stub_wifi_pm_sleep_lock_release,
-  ._phy_disable = rtems_wifi_stub_phy_disable,
-  ._phy_enable = rtems_wifi_stub_phy_enable,
+  ._wifi_pm_sleep_lock_acquire = rtems_wifi_pm_sleep_lock_acquire,
+  ._wifi_pm_sleep_lock_release = rtems_wifi_pm_sleep_lock_release,
+  ._phy_disable = rtems_wifi_phy_disable,
+  ._phy_enable = rtems_wifi_phy_enable,
   ._phy_update_country_info = rtems_wifi_stub_phy_update_country_info,
-  ._read_mac = rtems_wifi_stub_read_mac,
+  ._read_mac = rtems_wifi_read_mac,
   ._timer_arm = rtems_wifi_timer_arm,
   ._timer_disarm = rtems_wifi_timer_disarm,
   ._timer_done = rtems_wifi_timer_done,
   ._timer_setfn = rtems_wifi_timer_setfn,
   ._timer_arm_us = rtems_wifi_timer_arm_us,
-  ._wifi_reset_mac = rtems_wifi_stub_wifi_reset_mac,
-  ._wifi_clock_enable = rtems_wifi_stub_wifi_clock_enable,
-  ._wifi_clock_disable = rtems_wifi_stub_wifi_clock_disable,
+  ._wifi_reset_mac = rtems_wifi_reset_mac,
+  ._wifi_clock_enable = rtems_wifi_clock_enable,
+  ._wifi_clock_disable = rtems_wifi_clock_disable,
   ._wifi_rtc_enable_iso = rtems_wifi_stub_wifi_rtc_enable_iso,
   ._wifi_rtc_disable_iso = rtems_wifi_stub_wifi_rtc_disable_iso,
   ._esp_timer_get_time = rtems_wifi_esp_timer_get_time,
@@ -1709,10 +1830,10 @@ wifi_osi_funcs_t g_wifi_osi_funcs = {
   ._wifi_zalloc = rtems_wifi_zalloc,
   ._wifi_create_queue = rtems_wifi_create_queue,
   ._wifi_delete_queue = rtems_wifi_delete_queue,
-  ._coex_init = rtems_wifi_stub_coex_init,
-  ._coex_deinit = rtems_wifi_stub_coex_deinit,
-  ._coex_enable = rtems_wifi_stub_coex_enable,
-  ._coex_disable = rtems_wifi_stub_coex_disable,
+  ._coex_init = rtems_wifi_coex_init,
+  ._coex_deinit = rtems_wifi_coex_deinit,
+  ._coex_enable = rtems_wifi_coex_enable,
+  ._coex_disable = rtems_wifi_coex_disable,
   ._coex_status_get = rtems_wifi_stub_coex_status_get,
   ._coex_condition_set = rtems_wifi_stub_coex_condition_set,
   ._coex_wifi_request = rtems_wifi_stub_coex_wifi_request,
@@ -1727,8 +1848,8 @@ wifi_osi_funcs_t g_wifi_osi_funcs = {
   ._coex_schm_curr_period_get = rtems_wifi_stub_coex_schm_curr_period_get,
   ._coex_schm_curr_phase_get = rtems_wifi_stub_coex_schm_curr_phase_get,
   ._coex_schm_process_restart = rtems_wifi_stub_coex_schm_process_restart,
-  ._coex_schm_register_cb = rtems_wifi_stub_coex_schm_register_cb,
-  ._coex_register_start_cb = rtems_wifi_stub_coex_register_start_cb,
+  ._coex_schm_register_cb = rtems_wifi_coex_schm_register_cb,
+  ._coex_register_start_cb = rtems_wifi_coex_register_start_cb,
   ._coex_schm_flexible_period_set = rtems_wifi_stub_coex_schm_flexible_period_set,
   ._coex_schm_flexible_period_get = rtems_wifi_stub_coex_schm_flexible_period_get,
   ._coex_schm_get_phase_by_idx = rtems_wifi_stub_coex_schm_get_phase_by_idx,

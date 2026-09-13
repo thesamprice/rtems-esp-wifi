@@ -111,10 +111,13 @@ static rtems_task Init( rtems_task_argument arg )
 #define CONFIGURE_APPLICATION_NEEDS_SIMPLE_CONSOLE_DRIVER
 #define CONFIGURE_APPLICATION_NEEDS_CLOCK_DRIVER
 #define CONFIGURE_MAXIMUM_TASKS 16
-#define CONFIGURE_MAXIMUM_SEMAPHORES 32
+#define CONFIGURE_MAXIMUM_SEMAPHORES 64
 #define CONFIGURE_MAXIMUM_MESSAGE_QUEUES 16
 #define CONFIGURE_MAXIMUM_POSIX_KEYS 8
-#define CONFIGURE_MAXIMUM_TIMERS 8
+/* The WiFi libraries arm several ETS timers during init and start; 8 ran out
+ * and the adapter said so.  Not a defect -- an application-configuration
+ * number that the libraries' real demand has now measured. */
+#define CONFIGURE_MAXIMUM_TIMERS 32
 #define CONFIGURE_MAXIMUM_DRIVERS 8
 #define CONFIGURE_UNIFIED_WORK_AREAS
 #define CONFIGURE_INIT_TASK_STACK_SIZE ( 16 * 1024 )
