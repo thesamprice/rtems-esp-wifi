@@ -96,6 +96,27 @@ static unsigned char mac_ignored[ 6 ] = { 0x02, 0x52, 0x54, 0x00, 0x12, 0x34 };
  * this one exists because "the interface came up" alone would not distinguish
  * an event that never fired from a handler that ran and failed.
  */
+/*
+ * The network to associate with.
+ *
+ * Deliberately a placeholder rather than anything real.  Nothing in QEMU
+ * answers a probe request, so what this exercises is the path from
+ * esp_wifi_set_config() through esp_wifi_connect() into the scan, not an
+ * association -- and on hardware it should be overridden at build time rather
+ * than edited here, so that credentials never reach a commit.
+ */
+#ifndef WIFI_NET_SSID
+#define WIFI_NET_SSID "rtems-test-network"
+#endif
+
+#ifndef WIFI_NET_PASSWORD
+#define WIFI_NET_PASSWORD "not-a-real-password"
+#endif
+
+static volatile int sta_start_seen;
+static volatile int sta_connected_seen;
+static volatile int sta_disconnected_seen;
+
 static void on_wifi_event(
   void       *arg,
   const char *base,
@@ -107,6 +128,22 @@ static void on_wifi_event(
   (void) data;
 
   printf( "       event: %s id %i\n", base, (int) id );
+
+  if ( base != WIFI_EVENT ) {
+    return;
+  }
+
+  /*
+   * Counted rather than just printed, because the interesting assertions
+   * below are about which of these arrived.  A disconnect is the expected
+   * outcome here and is not a failure -- see the check that reads it.
+   */
+  switch ( id ) {
+    case WIFI_EVENT_STA_START:        ++sta_start_seen;        break;
+    case WIFI_EVENT_STA_CONNECTED:    ++sta_connected_seen;    break;
+    case WIFI_EVENT_STA_DISCONNECTED: ++sta_disconnected_seen; break;
+    default: break;
+  }
 }
 
 static void print_mac( const char *what, const uint8_t mac[ 6 ] )
@@ -297,6 +334,23 @@ static rtems_task Init( rtems_task_argument arg )
   check( "the interface starts link-down, as a radio should",
          !netif_is_link_up( &net_interface ) );
 
+  /*
+   * The credentials have to be set before esp_wifi_start(), not after.
+   * esp_wifi_connect() reads the configuration the station was started with;
+   * setting it afterwards is accepted and then ignored until the next start,
+   * which presents as a connect that never attempts anything.
+   */
+  {
+    wifi_config_t sta = { 0 };
+
+    strncpy( (char *) sta.sta.ssid, WIFI_NET_SSID, sizeof( sta.sta.ssid ) - 1 );
+    strncpy( (char *) sta.sta.password, WIFI_NET_PASSWORD,
+             sizeof( sta.sta.password ) - 1 );
+
+    rv = esp_wifi_set_config( WIFI_IF_STA, &sta );
+    check( "esp_wifi_set_config(STA)", rv == ESP_OK );
+  }
+
   printf( "calling esp_wifi_start...\n" );
   rv = esp_wifi_start();
   check( "esp_wifi_start", rv == ESP_OK );
@@ -315,6 +369,45 @@ static rtems_task Init( rtems_task_argument arg )
    */
   check( "the receive path was accepted and the interface came up",
          netif_is_up( &net_interface ) );
+
+  check( "STA_START was delivered to the handler", sta_start_seen > 0 );
+
+  /*
+   * Associate.
+   *
+   * Nothing in QEMU answers a probe request, so this is not expected to
+   * connect and the check below is written for that: what it asserts is that
+   * the call was accepted and that the libraries then reported a *result*.
+   *
+   * That is worth having even without an access point.  esp_wifi_connect()
+   * drives the scan, the supplicant and the connection state machine, and a
+   * disconnect event coming back means all three ran and reached a verdict
+   * rather than hanging -- which is the failure mode a half-wired OS adapter
+   * produces.
+   *
+   * It is also the prerequisite for a frame ever reaching the netif.  QEMU's
+   * MAC model injects frames today and libnet80211 drops them in sta_input,
+   * correctly, because without a connection attempt there is no BSS a data
+   * frame could belong to.
+   */
+  printf( "calling esp_wifi_connect to %s...\n", WIFI_NET_SSID );
+  rv = esp_wifi_connect();
+  printf( "esp_wifi_connect returned %i\n", (int) rv );
+  check( "esp_wifi_connect was accepted", rv == ESP_OK );
+
+  /* Long enough for the scan to give up and post a result. */
+  rtems_task_wake_after( 5 * rtems_clock_get_ticks_per_second() );
+
+  printf( "       STA_START %d  CONNECTED %d  DISCONNECTED %d\n",
+          sta_start_seen, sta_connected_seen, sta_disconnected_seen );
+
+  /*
+   * Either outcome is a pass.  Connected would mean something answered, which
+   * nothing in QEMU does; disconnected means the stack ran to a conclusion.
+   * Neither is a hang, and a hang is what this is really testing for.
+   */
+  check( "the connection attempt reached a verdict",
+         sta_connected_seen > 0 || sta_disconnected_seen > 0 );
 
   /*
    * Transmit.  Both shapes, because the chained one is the only path through
@@ -380,18 +473,21 @@ done:
    * eb_taken == eb_released might otherwise take it for a result.  It holds
    * vacuously: no frame reached this layer, so neither counter ever moved.
    *
-   * The reason changed once QEMU's MAC model learned to inject frames, and the
-   * old wording -- "QEMU has no WiFi MAC, so no frame can arrive" -- is no
-   * longer true.  Frames do arrive now, and the MAC interrupt is delivered and
-   * serviced; they are dropped one layer above this file.
+   * This explanation has now gone stale twice, which is a warning in itself:
+   * first when the MAC model learned to inject frames, and again when this
+   * example started calling esp_wifi_connect().  The number has been 0
+   * throughout and the reason has changed underneath it both times.  Check it
+   * against what the run actually does before trusting it.
    */
   printf(
-    "\nrx_frames is 0, and the reason is no longer that nothing arrives.\n"
-    "QEMU's MAC model injects frames and the interrupt is serviced -- they\n"
-    "reach sta_input inside libnet80211 and are dropped there, correctly,\n"
-    "because this image never calls esp_wifi_connect() so net80211 has no\n"
-    "BSS a data frame could belong to.  So eb_taken == eb_released above is\n"
-    "still true without having tested anything.\n"
+    "\nrx_frames is 0, and not because nothing arrives.  QEMU's MAC model\n"
+    "injects frames and the interrupt is serviced; they reach sta_input\n"
+    "inside libnet80211 and are dropped there, correctly.  This image does\n"
+    "call esp_wifi_connect(), but nothing in QEMU answers a probe request, so\n"
+    "the attempt ends in a disconnect and there is still no BSS a data frame\n"
+    "could belong to.  eb_taken == eb_released above is therefore still true\n"
+    "without having tested anything.\n"
+    "\nWhat is missing is a simulated access point in the MAC model.\n"
   );
 
   printf( "\n%d failure(s)\n", failures );
