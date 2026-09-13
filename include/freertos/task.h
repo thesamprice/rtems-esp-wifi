@@ -37,4 +37,27 @@
  */
 typedef void *TaskHandle_t;
 
+/*
+ * vTaskDelay() is declared here, and implemented in src/rtems_esp_glue.c,
+ * which is a departure from the rest of this directory.
+ *
+ * Everything else in include/freertos is types only, deliberately: where the
+ * WiFi libraries need to block or sleep they ask through wifi_osi_funcs_t,
+ * which is the seam Espressif designed for exactly that, and the file comment
+ * says a compile error is preferred to a stub.
+ *
+ * wpa_supplicant's port/eloop.c does not use that seam.  It calls vTaskDelay()
+ * directly, twice, because it was written against FreeRTOS rather than against
+ * the adapter.  So the choice is not "declaration or compile error" -- the
+ * compile error has no fix on the far side, since the supplicant is upstream
+ * source this port does not modify.  The choice is a real implementation or no
+ * supplicant.
+ *
+ * It is a real implementation and not a stub: the adapter's own task_delay
+ * entry is rtems_task_wake_after() on the same tick units, and this is the
+ * same call.  A stub returning immediately would turn eloop's wait loops into
+ * busy spins on a single-core part.
+ */
+void vTaskDelay( TickType_t ticks );
+
 #endif /* RTEMS_ESP_FREERTOS_TASK_H */

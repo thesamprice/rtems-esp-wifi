@@ -43,6 +43,18 @@
 #define CONFIG_IDF_TARGET_ESP32C3 1
 
 /*
+ * The same fact as a string.  esp_supplicant/src/esp_wps.c does
+ *
+ *     const char *wps_model_number = CONFIG_IDF_TARGET;
+ *
+ * at file scope, so without it that file does not compile and
+ * wps_get_wps_sm_cb() -- which esp_wpa_main.c calls unconditionally, WPS
+ * enabled or not -- is undefined at link.  ESP-IDF generates both forms from
+ * the one Kconfig choice; here they are two lines that must agree.
+ */
+#define CONFIG_IDF_TARGET "esp32c3"
+
+/*
  * Fine timing measurement.
  *
  * On for a reason that is not a preference: the blobs reference the 24
@@ -112,38 +124,102 @@
 #define CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM 2
 
 /*
- * wpa_supplicant's feature set.
+ * === wpa_supplicant ====================================================
  *
- * The supplicant is one body of source covering WPA2-PSK, WPA3-SAE and
- * enterprise EAP, and its structs change shape with these -- omitting one does
- * not disable a feature so much as produce a different ABI.  The compile error
- * is honest ("struct wpa_auth_config has no member named ieee80211w"), which
- * is how this set was arrived at rather than guessed.
+ * The supplicant's own feature macros -- CONFIG_IEEE80211W, CONFIG_WPS,
+ * CONFIG_CRYPTO_INTERNAL and the rest -- are deliberately NOT here, and an
+ * earlier version of this file that put them here was wrong in a way worth
+ * recording, because the build did not complain.
  *
- * The target is a WPA2-PSK station.  That choice is what keeps mbedtls small:
- * SAE and EAP-TLS are where the 190 mbedtls_mpi_ and 181 mbedtls_ecp_ call
- * sites live, and those pull in bignum, ECP, X.509 and TLS -- which in this
- * mbedtls are not even built by a PSA configuration.  A PSK station needs only
- * AES, SHA-1, SHA-256, HMAC and PBKDF2.
+ * A #define here reaches a supplicant source only indirectly and only late:
+ * utils/includes.h includes port/include/supplicant_opt.h, which includes this
+ * file.  So it arrives below the first #include and nowhere above it -- and 11
+ * of the 147 sources test a feature macro *above* their first #include.
+ * src/crypto/ccmp.c is the clearest:
+ *
+ *     #ifdef CONFIG_IEEE80211W        <- line 9
+ *     #include "utils/includes.h"     <- line 11
+ *
+ * The #include that would define the macro is inside the #ifdef the macro
+ * gates, so the file can never switch itself on.  Measured, same flags, one
+ * -D apart:
+ *
+ *     ccmp.o without CONFIG_IEEE80211W:   860 bytes, 0 defined symbols
+ *     ccmp.o with    CONFIG_IEEE80211W:  5824 bytes, 8 defined symbols
+ *
+ * The 860-byte one was in libwpa.a, satisfying nothing, while rsn_supp/wpa.h
+ * two directories over -- which includes sdkconfig.h at the top, before any
+ * test -- saw the macro set and laid out structs that assume it.  That is not
+ * a feature being off, it is two halves of one library disagreeing about a
+ * struct, and no diagnostic says so.
+ *
+ * Upstream does not have the problem because it never puts them here:
+ * components/wpa_supplicant/CMakeLists.txt passes them with
+ * target_compile_definitions(... PRIVATE ...), once, to every file.
+ * tools/supplicant-build.sh now does the same and carries that list.
+ *
+ * What belongs here is the layer above: the CONFIG_ESP_WIFI_* Kconfig choices
+ * that upstream's CMakeLists translates into those macros.  They are recorded
+ * as comments rather than #defines because nothing in this port reads them --
+ * the translation is done by hand in supplicant-build.sh -- and a #define that
+ * nothing reads is the same trap again.
+ *
+ * The choices, and what each costs:
+ *
+ *   CONFIG_ESP_WIFI_ENABLE_WPA3_SAE = n   (upstream default y)
+ *   CONFIG_ESP_WIFI_ENABLE_WPA3_OWE_STA = n
+ *       No WPA3-Personal and no Opportunistic Wireless Encryption.  Both need
+ *       elliptic-curve arithmetic; see the crypto entry below for why that is
+ *       not available yet.  A WPA3-only access point will not accept this
+ *       station.  A WPA3-transition AP will, over WPA2-PSK, which is what
+ *       CONFIG_IEEE80211W below is for.
+ *
+ *   CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT = n
+ *       No EAP-TLS/PEAP/TTLS, so no 802.1X network.  This is also why
+ *       mbedtls_config.h builds no TLS and no X.509.
+ *
+ *   CONFIG_ESP_WIFI_MBEDTLS_CRYPTO = n   (upstream default y)
+ *       The supplicant uses its own portable C crypto -- aes-internal.c,
+ *       sha1-internal.c, sha256-internal.c, crypto_internal*.c -- rather than
+ *       routing through mbedtls.  This is upstream's else-branch, not a
+ *       hand-made combination, and for a PSK station it is complete: CCMP,
+ *       the EAPOL-Key MIC, PBKDF2 and the RFC 3394 group-key unwrap are all
+ *       there.
+ *
+ *       It is not a preference.  esp_supplicant/src/crypto/crypto_mbedtls.c
+ *       is written against ESP-IDF's mbedtls *component*, not against
+ *       espressif/mbedtls: it includes "mbedtls/esp_config.h",
+ *       "mbedtls/ecp.h" and "mbedtls/bignum.h", and in mbedtls 4.x the last
+ *       two exist only as mbedtls/private/.  All three are supplied by
+ *       components/mbedtls/port/include, and esp_config.h in turn selects the
+ *       ESP32 hardware PSA drivers (psa_crypto_driver_esp_hmac_opaque_contexts.h,
+ *       absent here) and redefines the MBEDTLS_* set that libmbedtls.a was
+ *       compiled with -- which would give crypto_mbedtls.o a different
+ *       psa_hash_operation_t than the library it calls.  Turning this on means
+ *       porting components/mbedtls/port first.  See docs/step6-supplicant.md.
+ *
+ *       The cost is speed, not capability: PBKDF2-SHA1 runs 4096 HMAC
+ *       iterations in software once per association.  Nothing is lost to the
+ *       ESP32-C3's AES and SHA peripherals either, because this port does not
+ *       drive them -- the mbedtls built here is software as well.
+ *
+ *   CONFIG_ESP_WIFI_SOFTAP_SUPPORT = n
+ *   CONFIG_ESP_WIFI_11KV_SUPPORT = n, CONFIG_ESP_WIFI_RRM_SUPPORT = n,
+ *   CONFIG_ESP_WIFI_WNM_SUPPORT = n, CONFIG_ESP_WIFI_MBO_SUPPORT = n
+ *       No access-point mode and no 802.11k/v assisted roaming.  A station
+ *       still roams, it just does not get the neighbour report and BSS
+ *       transition hints, so it decides when to move on signal strength alone.
+ *
+ *   CONFIG_ESP_WIFI_DPP_SUPPORT = n, CONFIG_ESP_WIFI_NAN_USD_ENABLE = n,
+ *   CONFIG_ESP_WIFI_PASN_SUPPORT = n, CONFIG_ESP_WIFI_WPS_SOFTAP_REGISTRAR = n
+ *       Wi-Fi Easy Connect, Wi-Fi Aware, pre-association security negotiation
+ *       and the WPS registrar.  All upstream defaults, all off upstream too.
+ *
+ * CONFIG_IEEE80211W -- protected management frames -- is on, in
+ * supplicant-build.sh with the rest.  Upstream defines it unconditionally, and
+ * it matters here: WPA3-transition access points require PMF and a growing
+ * number of WPA2-only ones are configured to, so a station without it fails to
+ * associate with networks that look ordinary.
  */
-
-/*
- * Protected management frames.  On rather than off: WPA3-transition access
- * points require PMF, and an increasing number of WPA2-only ones are
- * configured to as well, so a station without it fails to associate with
- * networks that look ordinary.
- */
-#define CONFIG_IEEE80211W 1
-
-/*
- * No WPA3-SAE and no enterprise EAP for now.  Both are wanted eventually;
- * both need the elliptic-curve and TLS halves of mbedtls, which is its own
- * piece of work rather than a flag.
- */
-#undef CONFIG_WPA3_SAE
-#undef CONFIG_SAE
-#undef CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT
-#undef CONFIG_WPA_MBEDTLS_CRYPTO
-#undef CONFIG_WPS
 
 #endif /* RTEMS_ESP_SDKCONFIG_H */

@@ -33,6 +33,9 @@
  * list makes what remains easier to see.
  */
 
+/* For TickType_t and the vTaskDelay declaration this file implements. */
+#include <freertos/task.h>
+
 #include <rtems.h>
 #include <rtems/bspIo.h>
 
@@ -245,4 +248,25 @@ int __attribute__((weak)) os_get_time( struct rtems_esp_os_time *t )
   t->usec = tv.tv_usec;
 
   return rv;
+}
+
+/* === the one FreeRTOS call that is not behind the adapter ============== */
+
+/*
+ * wpa_supplicant's port/eloop.c calls vTaskDelay() directly rather than going
+ * through wifi_osi_funcs_t, so the port has to provide it.  See the comment on
+ * the declaration in include/freertos/task.h for why that is not a shim.
+ *
+ * FreeRTOS counts in ticks and so does rtems_task_wake_after(), so this is a
+ * unit-for-unit call rather than a conversion.  Zero means "yield" in
+ * FreeRTOS; RTEMS spells that RTEMS_YIELD_PROCESSOR, which is also 0, so the
+ * two agree without a special case -- but it is written out because relying on
+ * two constants happening to match is how the queue-return-convention bug got
+ * in.
+ */
+void vTaskDelay( TickType_t ticks )
+{
+  (void) rtems_task_wake_after(
+    ticks == 0 ? RTEMS_YIELD_PROCESSOR : (rtems_interval) ticks
+  );
 }

@@ -37,9 +37,15 @@ INC="-isystem $LIB/include -I $G/include
 # here is actually needed, it shows up as an undefined symbol rather than as
 # silence.  tools/applink.sh is that check.  The skipped list is printed every
 # time so it cannot quietly grow.
+#
+# tf-psa-crypto/platform is one file, platform_util.c, and it is the home of
+# mbedtls_platform_zeroize().  27 of the objects built here reference it, so
+# leaving the directory out produces an archive that cannot satisfy its own
+# members -- and says nothing about it until something pulls one of the 27 in.
 skipped=""
 for c in $M/library/*.c $M/tf-psa-crypto/core/*.c \
          $M/tf-psa-crypto/utilities/*.c \
+         $M/tf-psa-crypto/platform/*.c \
          $M/tf-psa-crypto/drivers/builtin/src/*.c; do
   o="$OUT/$(basename "$(dirname "$c")")_$(basename "$c" .c).o"
   if ! riscv-rtems7-gcc -march=rv32imc -mabi=ilp32 \
