@@ -109,8 +109,24 @@ static unsigned char mac_ignored[ 6 ] = { 0x02, 0x52, 0x54, 0x00, 0x12, 0x34 };
 #define WIFI_NET_SSID "rtems-test-network"
 #endif
 
+/*
+ * Empty, and that is a decision rather than an oversight.
+ *
+ * libnet80211's scan_parse_beacon tests the configured password against the
+ * candidate's privacy bit BEFORE any authmode threshold is consulted: with a
+ * non-empty password it refuses an open access point outright, logging "Open
+ * AP, but we want an encrypted AP, ignore".  So a station configured with a
+ * password can only ever associate with an encrypted network, and associating
+ * with the simulated AP in QEMU would then need the WPA2 four-way handshake --
+ * PBKDF2, PTK derivation, MIC, GTK unwrap -- and CCMP after it.
+ *
+ * An empty password takes the open path instead, which is what lets a frame
+ * reach the netif at all in emulation.  On hardware this must be overridden:
+ * pass -DWIFI_NET_PASSWORD=\"...\" at build time, which is also how the SSID
+ * is meant to be supplied.
+ */
 #ifndef WIFI_NET_PASSWORD
-#define WIFI_NET_PASSWORD "not-a-real-password"
+#define WIFI_NET_PASSWORD ""
 #endif
 
 static volatile int sta_start_seen;
@@ -479,16 +495,36 @@ done:
    * throughout and the reason has changed underneath it both times.  Check it
    * against what the run actually does before trusting it.
    */
-  printf(
-    "\nrx_frames is 0, and not because nothing arrives.  QEMU's MAC model\n"
-    "injects frames and the interrupt is serviced; they reach sta_input\n"
-    "inside libnet80211 and are dropped there, correctly.  This image does\n"
-    "call esp_wifi_connect(), but nothing in QEMU answers a probe request, so\n"
-    "the attempt ends in a disconnect and there is still no BSS a data frame\n"
-    "could belong to.  eb_taken == eb_released above is therefore still true\n"
-    "without having tested anything.\n"
-    "\nWhat is missing is a simulated access point in the MAC model.\n"
-  );
+  /*
+   * Derived from the counters, not written out.
+   *
+   * This paragraph was hand-written three times and was wrong twice: once when
+   * the MAC model learned to inject frames, and again when this example
+   * started calling esp_wifi_connect().  Each time the number stayed accurate
+   * and the sentence beside it rotted, which is worse than no sentence at all
+   * -- a reader checks the prose, believes it, and stops looking.
+   *
+   * So it now reports what the run actually did.  The point being made is the
+   * same either way: eb_taken == eb_released is trivially true when both are
+   * zero, and only means something when frames have gone through.
+   */
+  if ( stats->rx_frames == 0 ) {
+    printf(
+      "\nrx_frames is 0, so eb_taken == eb_released above is true without\n"
+      "having tested anything -- the receive path did not execute.  For it to\n"
+      "run, the station has to associate: QEMU's MAC model needs its simulated\n"
+      "access point enabled, and on hardware there has to be a real one.\n"
+    );
+  } else {
+    printf(
+      "\nrx_frames is %u, so eb_taken == eb_released is a real result: the\n"
+      "receive path ran and every eb handle the driver lent us was given\n"
+      "back.  That contract is the one thing here that cannot be checked by\n"
+      "reading the code -- leaking a handle is not an error, it is a radio\n"
+      "that goes quiet after the RX pool is exhausted.\n",
+      (unsigned) stats->rx_frames
+    );
+  }
 
   printf( "\n%d failure(s)\n", failures );
 
