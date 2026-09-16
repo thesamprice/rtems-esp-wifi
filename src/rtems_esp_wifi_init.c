@@ -101,6 +101,24 @@ extern int esp_supplicant_init( void );
 extern const esp_phy_init_data_t phy_init_data;
 
 /*
+ * Keeps the USB PHY alive across WiFi PHY initialisation.
+ *
+ * This is a silicon workaround rather than a preference.  ESP-IDF gates it on
+ * SOC_WIFI_PHY_NEEDS_USB_WORKAROUND and gives CONFIG_ESP_PHY_ENABLE_USB
+ * "default y if IDF_TARGET_ESP32C3", and esp_phy_load_cal_and_init() calls it
+ * immediately before register_chipv7_phy().  The WiFi PHY and the
+ * USB-Serial-JTAG share the BBPLL, so bringing the one up without this takes
+ * the other down with it -- and here the console *is* the USB-Serial-JTAG.
+ *
+ * Declared rather than included for the same reason as esp_supplicant_init()
+ * above: it is private to esp_phy and the header is not installed.
+ */
+extern void phy_bbpll_en_usb( bool en );
+
+/* ROM, via esp32c3.rom.ld.  Retimes ets_delay_us() for a new CPU frequency. */
+extern void ets_update_cpu_frequency( uint32_t cpu_mhz );
+
+/*
  * The blobs' own sections, placed by ld/esp32c3-wifi-sections.ld.
  *
  * .wifi_iram is 44 KiB of code that cannot execute from flash, so it is loaded
@@ -236,9 +254,12 @@ static inline void rtems_wifi_reg_write( uint32_t addr, uint32_t value )
 /* soc/esp32c3/register/soc/rtc_cntl_reg.h */
 #define RTEMS_WIFI_RTC_BASE           0x60008000u
 #define RTEMS_WIFI_RTC_DIG_PWC_REG    ( RTEMS_WIFI_RTC_BASE + 0x0088u )
-#define RTEMS_WIFI_RTC_WIFI_FORCE_PD  ( 1u << 17 )
-#define RTEMS_WIFI_RTC_DIG_ISO_REG    ( RTEMS_WIFI_RTC_BASE + 0x008Cu )
-#define RTEMS_WIFI_RTC_WIFI_FORCE_ISO ( 1u << 28 )
+#define RTEMS_WIFI_RTC_WIFI_FORCE_PD    ( 1u << 17 )
+#define RTEMS_WIFI_RTC_WIFI_FORCE_PU    ( 1u << 18 )
+#define RTEMS_WIFI_RTC_WIFI_PD_EN       ( 1u << 30 )
+#define RTEMS_WIFI_RTC_DIG_ISO_REG      ( RTEMS_WIFI_RTC_BASE + 0x008Cu )
+#define RTEMS_WIFI_RTC_WIFI_FORCE_ISO   ( 1u << 28 )
+#define RTEMS_WIFI_RTC_WIFI_FORCE_NOISO ( 1u << 29 )
 
 /* syscon_reg.h: SYSTEM_WIFI_CLK_WIFI_BT_COMMON_M, and MODEM_RESET_FIELD_WHEN_PU
  * spelled out because the header composes it from ten BT and WiFi bits. */
@@ -248,14 +269,152 @@ static inline void rtems_wifi_reg_write( uint32_t addr, uint32_t value )
   ( ( 1u << 0 ) | ( 1u << 1 ) | ( 1u << 2 ) | ( 1u << 3 ) |                    \
     ( 1u << 4 ) | ( 1u << 9 ) | ( 1u << 11 ) | ( 1u << 13 ) )
 
+/*
+ * The blocks register_chipv7_phy() calibrates against, for the probe below.
+ * reg_base.h names FE and BB; 0x6001C000 is the AGC block, which that header
+ * does not name but which sits immediately below DR_REG_NRX_BASE (0x6001CC00)
+ * exactly as AGC does on the original ESP32.
+ */
+#define RTEMS_WIFI_FE_BASE            0x60006000u
+#define RTEMS_WIFI_FE_IQ_EST_REG      ( RTEMS_WIFI_FE_BASE + 0x174u )
+#define RTEMS_WIFI_FE_IQ_EST_DONE     ( 1u << 16 )
+#define RTEMS_WIFI_AGC_BASE           0x6001C000u
+#define RTEMS_WIFI_AGC_STATE_REG      ( RTEMS_WIFI_AGC_BASE + 0x08Cu )
+
+/* soc/esp32c3/regi2c_defs.h: the internal I2C analog master. */
+#define RTEMS_WIFI_I2C_MST_ANA_CONF0_REG  0x6000E040u
+#define RTEMS_WIFI_ANA_CONFIG_REG         0x6000E044u
+#define RTEMS_WIFI_ANA_CONFIG2_REG        0x6000E048u
+#define RTEMS_WIFI_ANA_CONFIG_M           ( 0x3FFu << 8 )
+#define RTEMS_WIFI_ANA_I2C_SAR_FORCE_PD   ( 1u << 18 )
+#define RTEMS_WIFI_ANA_I2C_SAR_FORCE_PU   ( 1u << 16 )
+
+/* soc/esp32c3/register/soc/system_reg.h */
+#define RTEMS_WIFI_SYSTEM_CPU_PER_CONF_REG  0x600C0008u
+#define RTEMS_WIFI_SYSTEM_SYSCLK_CONF_REG   0x600C0058u
+
+/*
+ * Which calibration register_chipv7_phy() is asked for.  Overridable at build
+ * time because the three modes are the cheapest way to tell a calibration that
+ * cannot converge from one that is never reached: PHY_RF_CAL_NONE skips the
+ * estimators entirely.
+ */
+#ifndef RTEMS_WIFI_CAL_MODE
+#define RTEMS_WIFI_CAL_MODE PHY_RF_CAL_FULL
+#endif
+
+/* soc/esp32c3/register/soc/efuse_reg.h */
+#define RTEMS_WIFI_EFUSE_BASE         0x60008800u
+#define RTEMS_WIFI_EFUSE_MAC0_REG     ( RTEMS_WIFI_EFUSE_BASE + 0x44u )
+#define RTEMS_WIFI_EFUSE_MAC1_REG     ( RTEMS_WIFI_EFUSE_BASE + 0x48u )
+
+/*
+ * Says whether the blocks the calibration spins on are clocked.
+ *
+ * register_chipv7_phy() hangs inside ram_iq_est_enable() polling
+ * FE[0x174] bit 16, the IQ estimator's done flag, with no timeout: the loop's
+ * only exit is that bit going high.  A dead clock and a mis-programmed
+ * estimator look identical from outside, so this samples the AGC state word
+ * twice.  AGC[0x8c] bits [18:12] are what that same loop reads, and they are
+ * the counter ram_iq_est_enable() compares against 69 -- so if they do not
+ * move between two reads the block has no clock, and if they do the clock is
+ * fine and the estimator itself is not converging.
+ *
+ * Printed rather than asserted.  The point is to distinguish two causes, not
+ * to pass or fail, and the numbers are the evidence.
+ */
+#ifdef RTEMS_WIFI_DEBUG_NO_WDT
+/*
+ * Turns every watchdog off, so a hang inside the PHY blob stays a hang.
+ *
+ * Debugging only, and deliberately not the default.  register_chipv7_phy()
+ * spins with no timeout, the TIMG0 watchdog resets the chip about 1.5s later,
+ * and the reset tears down the USB device -- which takes the built-in JTAG
+ * with it, so OpenOCD cannot finish examining the debug module before the next
+ * reset.  Without the resets the board sits still in the spin loop and can be
+ * halted and inspected.
+ *
+ * The super-watchdog has no disable bit; auto-feed is the documented way to
+ * stop it.  Each of the four is behind a write-protect key.
+ */
+static void rtems_esp_wifi_watchdogs_off( void )
+{
+  rtems_wifi_reg_write( 0x6001F064u, 0x50D83AA1u );  /* TIMG0 WDT unlock */
+  rtems_wifi_reg_write( 0x6001F048u, 0u );
+  rtems_wifi_reg_write( 0x60020064u, 0x50D83AA1u );  /* TIMG1 WDT unlock */
+  rtems_wifi_reg_write( 0x60020048u, 0u );
+  rtems_wifi_reg_write( 0x600080A8u, 0x50D83AA1u );  /* RTC WDT unlock */
+  rtems_wifi_reg_write( 0x60008090u, 0u );
+  rtems_wifi_reg_write( 0x600080B0u, 0x8F1D312Au );  /* RTC SWD unlock */
+  rtems_wifi_reg_write( 0x600080ACu, 0x80000000u );  /* SWD_AUTO_FEED_EN */
+  rtems_wifi_reg_write( 0x600080B0u, 0u );
+
+  printk( "rtems-esp-wifi: watchdogs disabled, a hang will now stay a hang\n" );
+}
+#endif
+
+/*
+ * Puts the CPU on the BBPLL at 160MHz, so the APB runs at 80.
+ *
+ * ESP-IDF does this in the second-stage bootloader's rtc_clk_init(), and a
+ * direct-boot image has no second stage: the ROM leaves the CPU on the 40MHz
+ * crystal, SYSTEM_SYSCLK_CONF reads SOC_CLK_SEL 0, and everything else in the
+ * system is happy there.  The PHY is not.  ESP-IDF holds an
+ * ESP_PM_APB_FREQ_MAX lock for as long as WiFi is up precisely because the
+ * radio's timing is specified against an 80MHz APB, and on the C3 the APB is
+ * 80MHz exactly when the CPU is driven from the PLL.
+ *
+ * ets_delay_us() is retimed afterwards because it is calibrated in CPU ticks
+ * and ram_iq_est_enable() calls it between arming the estimator and polling
+ * for the result.
+ *
+ * The BBPLL itself is already running -- the USB-Serial-JTAG that carries this
+ * console is fed from it -- so only the CPU mux and the divider move here.
+ */
+static void rtems_esp_wifi_cpu_clock_to_pll( void )
+{
+  uint32_t reg;
+
+  /* CPUPERIOD_SEL = 1, which is 160MHz given PLL_FREQ_SEL's 480MHz. */
+  reg = rtems_wifi_reg_read( RTEMS_WIFI_SYSTEM_CPU_PER_CONF_REG );
+  reg = ( reg & ~0x3u ) | 1u;
+  rtems_wifi_reg_write( RTEMS_WIFI_SYSTEM_CPU_PER_CONF_REG, reg );
+
+  /* Then the mux, and PRE_DIV_CNT back to divide-by-one.  This order is
+   * ESP-IDF's: the period is chosen before the source that makes it apply. */
+  reg = rtems_wifi_reg_read( RTEMS_WIFI_SYSTEM_SYSCLK_CONF_REG );
+  reg &= ~0x3FFu;
+  reg = ( reg & ~( 0x3u << 10 ) ) | ( 1u << 10 );
+  rtems_wifi_reg_write( RTEMS_WIFI_SYSTEM_SYSCLK_CONF_REG, reg );
+
+  ets_update_cpu_frequency( 160u );
+}
+
 static void rtems_esp_wifi_power_domain_on( void )
 {
   uint32_t reg;
 
-  /* Out of power-down. */
+  /*
+   * Powered, and forced so rather than left to the automatic control.
+   *
+   * ESP-IDF only clears WIFI_FORCE_PD here, because it can rely on
+   * WIFI_FORCE_PU and WIFI_FORCE_NOISO still holding their reset value of 1.
+   * On this boot path they do not: read back on hardware, DIG_PWC is
+   * 0x00000800 and DIG_ISO is 0x00400080 by the time the port runs -- BT
+   * forced down and isolated, and every FORCE_PU/FORCE_NOISO bit clear,
+   * including WiFi's.  With neither FORCE_PU nor FORCE_PD set the domain is
+   * under automatic control, and the whole modem digital block reads back as
+   * zero: FE[0x174] and AGC[0x8c] are 0, writes do not stick, and
+   * register_chipv7_phy() spins forever in ram_iq_est_enable() waiting on a
+   * done flag in a block that is not there.
+   *
+   * So set the two positives as well as clearing the two negatives, and clear
+   * WIFI_PD_EN so nothing power-gates the domain behind our back.
+   */
   reg = rtems_wifi_reg_read( RTEMS_WIFI_RTC_DIG_PWC_REG );
-  rtems_wifi_reg_write( RTEMS_WIFI_RTC_DIG_PWC_REG,
-                        reg & ~RTEMS_WIFI_RTC_WIFI_FORCE_PD );
+  reg &= ~( RTEMS_WIFI_RTC_WIFI_FORCE_PD | RTEMS_WIFI_RTC_WIFI_PD_EN );
+  reg |= RTEMS_WIFI_RTC_WIFI_FORCE_PU;
+  rtems_wifi_reg_write( RTEMS_WIFI_RTC_DIG_PWC_REG, reg );
 
   /*
    * ESP-IDF waits 10us here for the rails to come up before touching the
@@ -284,10 +443,16 @@ static void rtems_esp_wifi_power_domain_on( void )
   rtems_wifi_reg_write( RTEMS_WIFI_RST_EN_REG,
                         reg & ~RTEMS_WIFI_MODEM_RESET_WHEN_PU );
 
-  /* Out of isolation.  Order matters: power, then reset, then this. */
+  /*
+   * Out of isolation.  Order matters: power, then reset, then this.
+   * FORCE_NOISO for the same reason as FORCE_PU above -- clearing FORCE_ISO
+   * alone only returns the domain to automatic isolation, which is the state
+   * it was already in and which keeps the block dark.
+   */
   reg = rtems_wifi_reg_read( RTEMS_WIFI_RTC_DIG_ISO_REG );
-  rtems_wifi_reg_write( RTEMS_WIFI_RTC_DIG_ISO_REG,
-                        reg & ~RTEMS_WIFI_RTC_WIFI_FORCE_ISO );
+  reg &= ~RTEMS_WIFI_RTC_WIFI_FORCE_ISO;
+  reg |= RTEMS_WIFI_RTC_WIFI_FORCE_NOISO;
+  rtems_wifi_reg_write( RTEMS_WIFI_RTC_DIG_ISO_REG, reg );
 
   /*
    * The common clock goes back OFF here to match ESP-IDF's power-domain
@@ -365,6 +530,65 @@ esp_err_t esp_wifi_init( const wifi_init_config_t *config )
   printk( "rtems-esp-wifi: powering the modem domain...\n" );
   rtems_esp_wifi_power_domain_on();
   rtems_esp_wifi_clocks_on();
+  /*
+   * Let the internal I2C analog bus reach the RF blocks.
+   *
+   * ANA_CONFIG_REG bits [17:8] are a *disable* mask over the ten analog
+   * targets the bus can address -- a bit set means that target is cut off --
+   * and ANA_I2C_SAR_FORCE_PD/PU gate the SAR analog, which is the receive
+   * ADC.  ESP-IDF opens these through regi2c_ctrl_ll_i2c_bbpll_enable() and
+   * regi2c_ctrl_ll_i2c_sar_periph_enable(); nothing on this boot path does.
+   *
+   * It is the last thing between the FE and a working estimator.
+   * ram_iq_est_enable() arms the estimator entirely through FE registers --
+   * FE[0x140], FE[0x144], then it polls FE[0x174] bit 16 -- and those writes
+   * demonstrably land, because the FE window answers 52 of 64 words after the
+   * power-up.  What it is waiting on is the receive chain actually producing
+   * samples, and that is analog: the RF synthesiser and the ADC, both reached
+   * only over this bus.  With the bus masked off the digital side looks
+   * perfect and the estimate never completes, which is exactly what the
+   * hardware does.
+   */
+  {
+    uint32_t reg = rtems_wifi_reg_read( RTEMS_WIFI_ANA_CONFIG_REG );
+
+    printk( "rtems-esp-wifi: analog bus conf0 %08x config %08x config2 %08x\n",
+            rtems_wifi_reg_read( RTEMS_WIFI_I2C_MST_ANA_CONF0_REG ),
+            reg,
+            rtems_wifi_reg_read( RTEMS_WIFI_ANA_CONFIG2_REG ) );
+
+    reg &= ~RTEMS_WIFI_ANA_CONFIG_M;        /* every target reachable */
+    reg &= ~RTEMS_WIFI_ANA_I2C_SAR_FORCE_PD;
+    rtems_wifi_reg_write( RTEMS_WIFI_ANA_CONFIG_REG, reg );
+
+    reg = rtems_wifi_reg_read( RTEMS_WIFI_ANA_CONFIG2_REG );
+    rtems_wifi_reg_write( RTEMS_WIFI_ANA_CONFIG2_REG,
+                          reg | RTEMS_WIFI_ANA_I2C_SAR_FORCE_PU );
+
+    /*
+     * And the system clock, which nothing on this boot path configures.
+     * ESP-IDF's second-stage bootloader runs rtc_clk_init() and leaves the CPU
+     * on the BBPLL at 160MHz with the crystal frequency recorded in
+     * RTC_CNTL_STORE4; a direct-boot image has no second stage, so whatever
+     * the ROM left is what the PHY gets.  SOC_CLK_SEL 0 means the CPU is still
+     * on the crystal, and STORE4 not reading 40 in both halves means
+     * rtc_clk_xtal_freq_get() cannot tell the PHY what the crystal is.
+     */
+    printk( "rtems-esp-wifi: sysclk %08x cpuperconf %08x xtalfreq %08x\n",
+            rtems_wifi_reg_read( 0x600C0058u ),
+            rtems_wifi_reg_read( 0x600C0008u ),
+            rtems_wifi_reg_read( 0x600080B8u ) );
+
+    printk( "rtems-esp-wifi: analog bus opened, config now %08x / %08x\n",
+            rtems_wifi_reg_read( RTEMS_WIFI_ANA_CONFIG_REG ),
+            rtems_wifi_reg_read( RTEMS_WIFI_ANA_CONFIG2_REG ) );
+
+    rtems_esp_wifi_cpu_clock_to_pll();
+
+    printk( "rtems-esp-wifi: cpu on pll, sysclk %08x cpuperconf %08x\n",
+            rtems_wifi_reg_read( RTEMS_WIFI_SYSTEM_SYSCLK_CONF_REG ),
+            rtems_wifi_reg_read( RTEMS_WIFI_SYSTEM_CPU_PER_CONF_REG ) );
+  }
 
   esp_wifi_set_sleep_min_active_time( RTEMS_WIFI_MIN_ACTIVE_TIME_US );
   esp_wifi_set_keep_alive_time( RTEMS_WIFI_KEEP_ALIVE_TIME_US );
@@ -378,12 +602,48 @@ esp_err_t esp_wifi_init( const wifi_init_config_t *config )
    * rejects *input* calibration data, which cannot happen here, so anything
    * non-zero is worth reporting rather than ignoring.
    */
+  /*
+   * The MAC goes into the calibration data before calibrating, which
+   * esp_phy_load_cal_and_init() does and this port did not:
+   *
+   *     ESP_ERROR_CHECK( esp_efuse_mac_get_default( sta_mac ) );
+   *     memcpy( cal_data->mac, sta_mac, 6 );
+   *
+   * Read straight from eFuse rather than through esp_wifi_get_mac(), because
+   * this runs before the WiFi libraries are initialised and there is nothing
+   * to ask.  Byte order is the same trap as in the OS adapter's _read_mac:
+   * mac[0] is the MOST significant byte, opposite to the two eFuse words.
+   */
+  {
+    uint32_t mac0 = rtems_wifi_reg_read( RTEMS_WIFI_EFUSE_MAC0_REG );
+    uint32_t mac1 = rtems_wifi_reg_read( RTEMS_WIFI_EFUSE_MAC1_REG );
+
+    rtems_wifi_cal_data.mac[ 0 ] = (uint8_t) ( ( mac1 >> 8 ) & 0xffu );
+    rtems_wifi_cal_data.mac[ 1 ] = (uint8_t) ( mac1 & 0xffu );
+    rtems_wifi_cal_data.mac[ 2 ] = (uint8_t) ( ( mac0 >> 24 ) & 0xffu );
+    rtems_wifi_cal_data.mac[ 3 ] = (uint8_t) ( ( mac0 >> 16 ) & 0xffu );
+    rtems_wifi_cal_data.mac[ 4 ] = (uint8_t) ( ( mac0 >> 8 ) & 0xffu );
+    rtems_wifi_cal_data.mac[ 5 ] = (uint8_t) ( mac0 & 0xffu );
+
+    printk( "rtems-esp-wifi: calibrating for MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+            rtems_wifi_cal_data.mac[ 0 ], rtems_wifi_cal_data.mac[ 1 ],
+            rtems_wifi_cal_data.mac[ 2 ], rtems_wifi_cal_data.mac[ 3 ],
+            rtems_wifi_cal_data.mac[ 4 ], rtems_wifi_cal_data.mac[ 5 ] );
+  }
+
+#ifdef RTEMS_WIFI_DEBUG_NO_WDT
+  rtems_esp_wifi_watchdogs_off();
+#endif
+
+  /* Before calibration, as esp_phy_load_cal_and_init() does. */
+  phy_bbpll_en_usb( true );
+
   printk( "rtems-esp-wifi: register_chipv7_phy( PHY_RF_CAL_FULL )...\n" );
 
   phy_result = register_chipv7_phy(
     &phy_init_data,
     &rtems_wifi_cal_data,
-    PHY_RF_CAL_FULL
+    RTEMS_WIFI_CAL_MODE
   );
 
   /*
