@@ -265,6 +265,19 @@ static inline void rtems_wifi_reg_write( uint32_t addr, uint32_t value )
  * spelled out because the header composes it from ten BT and WiFi bits. */
 #define RTEMS_WIFI_CLK_BT_COMMON_M    0x78078Fu
 #define RTEMS_WIFI_CLK_PHY_EN_M       0x400000u
+/*
+ * The WiFi MAC's clock.  No public header names it: it is in neither
+ * SYSTEM_WIFI_CLK_WIFI_BT_COMMON_M nor SYSTEM_WIFI_CLK_PHY_EN_M, and
+ * SYSTEM_WIFI_CLK_WIFI_EN_M -- which is what ESP-IDF's wifi_module_enable()
+ * sets for PERIPH_WIFI_MODULE -- is defined as 0 on this chip, so that call is
+ * a no-op here and something else has to do the work.
+ *
+ * Found by bisection, not by reading.  Without it the MAC window at
+ * 0x60033000 answers none of its first 64 words and hal_init() spins forever
+ * on the bring-up acknowledge in MAC[0x0d14]; with it the window answers 48 of
+ * 64 and esp_wifi_start() returns.
+ */
+#define RTEMS_WIFI_CLK_MAC_EN         ( 1u << 6 )
 #define RTEMS_WIFI_MODEM_RESET_WHEN_PU                                        \
   ( ( 1u << 0 ) | ( 1u << 1 ) | ( 1u << 2 ) | ( 1u << 3 ) |                    \
     ( 1u << 4 ) | ( 1u << 9 ) | ( 1u << 11 ) | ( 1u << 13 ) )
@@ -350,6 +363,53 @@ static void rtems_esp_wifi_watchdogs_off( void )
   rtems_wifi_reg_write( 0x600080B0u, 0u );
 
   printk( "rtems-esp-wifi: watchdogs disabled, a hang will now stay a hang\n" );
+}
+#endif
+
+#ifdef RTEMS_WIFI_DEBUG_PROBE
+/*
+ * Does a register window answer the bus?
+ *
+ * Reading a modem register gives zero whether the block is absent or merely
+ * idle, so a read cannot tell the two apart.  A write can: invert a word,
+ * read it back, put the original back.  Restoring matters because the blob
+ * runs afterwards and would otherwise inherit a corrupted register, and the
+ * restore is exact because the saved value is what the bus itself reported.
+ *
+ * Any single register may be read-only or reserved and would report "dark" on
+ * a live bus, so this counts over a whole window instead of trusting one
+ * address.  That distinction is what identified the PHY calibration hang: FE
+ * answered 52 of 64 words while AGC, NRX and BB answered none.
+ */
+static bool rtems_esp_wifi_reg_writable( uint32_t addr )
+{
+  uint32_t saved = rtems_wifi_reg_read( addr );
+  uint32_t back;
+
+  rtems_wifi_reg_write( addr, ~saved );
+  back = rtems_wifi_reg_read( addr );
+  rtems_wifi_reg_write( addr, saved );
+
+  return back != saved;
+}
+
+static void rtems_esp_wifi_probe_window(
+  const char *name,
+  uint32_t    base,
+  unsigned    words
+)
+{
+  unsigned live = 0;
+  unsigned i;
+
+  for ( i = 0; i < words; ++i ) {
+    if ( rtems_esp_wifi_reg_writable( base + i * 4u ) ) {
+      ++live;
+    }
+  }
+
+  printk( "rtems-esp-wifi: probe %s %08x: %u/%u writable\n",
+          name, base, live, words );
 }
 #endif
 
@@ -486,7 +546,8 @@ static void rtems_esp_wifi_clocks_on( void )
 
   rtems_wifi_reg_write(
     RTEMS_WIFI_CLK_EN_REG,
-    reg | RTEMS_WIFI_CLK_BT_COMMON_M | RTEMS_WIFI_CLK_PHY_EN_M
+    reg | RTEMS_WIFI_CLK_BT_COMMON_M | RTEMS_WIFI_CLK_PHY_EN_M |
+      RTEMS_WIFI_CLK_MAC_EN
   );
 }
 
@@ -681,6 +742,23 @@ esp_err_t esp_wifi_init( const wifi_init_config_t *config )
   }
 
   printk( "rtems-esp-wifi: libraries initialised, esp_supplicant_init()...\n" );
+
+#ifdef RTEMS_WIFI_DEBUG_PROBE
+  /*
+   * hal_init() sets bit 1 of MAC[0x60033d14] and spins until bit 0 reads back
+   * set -- a request/acknowledge for MAC bring-up that silicon never
+   * acknowledges, though QEMU's model does.  Whether the MAC window answers
+   * the bus at all decides whether that is a dead block or a live one
+   * declining to finish.
+   */
+  rtems_esp_wifi_probe_window( "MAC  ", 0x60033000u, 64u );
+  rtems_esp_wifi_probe_window( "MACd ", 0x60033d00u, 32u );
+  printk( "rtems-esp-wifi: mac[0d14] %08x clk_en %08x rst_en %08x\n",
+          rtems_wifi_reg_read( 0x60033D14u ),
+          rtems_wifi_reg_read( RTEMS_WIFI_CLK_EN_REG ),
+          rtems_wifi_reg_read( RTEMS_WIFI_RST_EN_REG ) );
+
+#endif
 
   result = esp_supplicant_init();
 
