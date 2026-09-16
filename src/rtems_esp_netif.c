@@ -466,6 +466,33 @@ static void rtems_esp_netif_core_call(
   }
 }
 
+/*
+ * Install the receive path again, discarding the record that it is already
+ * installed.
+ *
+ * esp_wifi_internal_reg_rxcb() is one callback per interface and the last
+ * writer wins, with no error either way -- and a registration made before the
+ * station associates does not survive the association.  Proved on a stock
+ * ESP-IDF image on the same chip: registering at boot and again before the
+ * connection both return ESP_OK and never fire, and re-registering after
+ * WIFI_EVENT_STA_CONNECTED has been posted starts delivering frames
+ * immediately.
+ *
+ * Posting the event is not late enough either.  Re-registering from the
+ * WIFI_EVENT_STA_CONNECTED handler changes nothing, so the driver installs its
+ * own callback somewhere after it posts that event; the working case on stock
+ * was a periodic re-registration that happened to land afterwards.
+ *
+ * So this is separate from rtems_esp_netif_start(), which returns success
+ * without doing anything when it believes the path is already attached.
+ */
+int rtems_esp_netif_reattach( void )
+{
+  rtems_esp_netif_attached = false;
+
+  return rtems_esp_netif_start();
+}
+
 int rtems_esp_netif_start( void )
 {
   int rv;

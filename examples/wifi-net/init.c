@@ -663,6 +663,36 @@ static rtems_task Init( rtems_task_argument arg )
     }
   }
 
+#ifdef WIFI_NET_MAC_BITFIX
+    /*
+     * Clear the two MAC bits this port sets and a working image does not.
+     *
+     * From the word-level A/B in #115: 0x60033c34 reads 0x19a8f9e0 here and
+     * 0x19a879e0 on stock, and 0x60033c38 reads 0x0400041f here and 0x0000041f
+     * there -- bit 15 and bit 26 respectively, by XOR rather than by eye.  Everything around them matches
+     * word for word, so these are not live state.
+     *
+     * A bit that this port sets and a working image leaves clear is more
+     * likely to be our mistake than the reverse, which is the whole reason to
+     * try clearing rather than setting.  Blind, in the sense that no
+     * documentation names either bit -- but bit 6 of the clock register was
+     * equally undocumented and was the MAC's clock.
+     */
+    {
+      uint32_t a = *(volatile uint32_t *) (uintptr_t) 0x60033c34u;
+      uint32_t b = *(volatile uint32_t *) (uintptr_t) 0x60033c38u;
+
+      *(volatile uint32_t *) (uintptr_t) 0x60033c34u = a & ~( 1u << 15 );
+      *(volatile uint32_t *) (uintptr_t) 0x60033c38u = b & ~( 1u << 26 );
+
+      printf( "mac bitfix: 0x60033c34 %08x -> %08x, 0x60033c38 %08x -> %08x\n",
+              (unsigned) a,
+              (unsigned) *(volatile uint32_t *) (uintptr_t) 0x60033c34u,
+              (unsigned) b,
+              (unsigned) *(volatile uint32_t *) (uintptr_t) 0x60033c38u );
+    }
+#endif
+
 #ifdef WIFI_NET_FIX_RATE
   /*
    * Pin the data rate to 1 Mbps, long preamble.
@@ -686,6 +716,22 @@ static rtems_task Init( rtems_task_argument arg )
   rv = esp_wifi_internal_set_fix_rate( WIFI_IF_STA, true, WIFI_PHY_RATE_1M_L );
   printf( "esp_wifi_internal_set_fix_rate(1M) returned %i\n", (int) rv );
 #endif
+
+  /*
+   * Install the receive path again, now that the station has associated.
+   *
+   * The port installs it on WIFI_EVENT_STA_START, and
+   * esp_wifi_internal_reg_rxcb() does not keep a registration made before the
+   * association -- it reports ESP_OK and then never calls the callback.  This
+   * is well after WIFI_EVENT_STA_CONNECTED, because posting that event is
+   * itself too early: the driver installs its own callback somewhere after it.
+   */
+  if ( sta_connected_seen > 0 ) {
+    int rr = rtems_esp_netif_reattach();
+
+    printf( "rtems_esp_netif_reattach returned %i\n", rr );
+    check( "the receive path was reinstalled after associating", rr == 0 );
+  }
 
   /*
    * DHCP, but only if the station actually associated.
