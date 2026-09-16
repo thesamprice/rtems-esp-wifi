@@ -663,6 +663,30 @@ static rtems_task Init( rtems_task_argument arg )
     }
   }
 
+#ifdef WIFI_NET_FIX_RATE
+  /*
+   * Pin the data rate to 1 Mbps, long preamble.
+   *
+   * An access point acknowledges a correctly received unicast frame at layer
+   * 2 whether or not it later discards it -- a decryption failure still gets
+   * an ACK.  So the transmit retry counters in the MAC, which an A/B against a
+   * stock image showed running twenty to thirty times higher here than there,
+   * do not say "the access point rejected this": they say it never decoded it.
+   *
+   * Management frames go out at the lowest basic rate and are what association
+   * is made of, and association works.  Data frames go out at whatever rate
+   * control picks.  That is the one part of the path that differs between the
+   * frames that work and the frames that do not, and it is testable in one
+   * line.
+   *
+   * If DHCP binds with this on, the fault is rate control and not encryption,
+   * and everything upstream of here -- the handshake, the keys, the cipher
+   * negotiation -- was a red herring.
+   */
+  rv = esp_wifi_internal_set_fix_rate( WIFI_IF_STA, true, WIFI_PHY_RATE_1M_L );
+  printf( "esp_wifi_internal_set_fix_rate(1M) returned %i\n", (int) rv );
+#endif
+
   /*
    * DHCP, but only if the station actually associated.
    *
@@ -727,6 +751,37 @@ static rtems_task Init( rtems_task_argument arg )
             ip4addr_ntoa( netif_ip4_netmask( &net_interface ) ) );
     printf( "       gateway %s\n",
             ip4addr_ntoa( netif_ip4_gw( &net_interface ) ) );
+
+#ifdef WIFI_NET_MAC_WORDS
+    /*
+     * The one block the fingerprint found a structural difference in.
+     *
+     * A stock ESP-IDF image on this board reads 0x60033200's first non-zero
+     * word as 0xc0000005 where this port reads 0x000001ff -- a configuration
+     * register holding a different value, not a counter caught at a different
+     * moment, which is what every other difference in that window turned out
+     * to be.  Word for word is the only way to say which offsets those are.
+     */
+    {
+      uint32_t base;
+
+      printf( "--- MAC words 0x60033c00..0x60033dfc ---\n" );
+
+      for ( base = 0x60033c00u; base < 0x60033e00u; base += 32u ) {
+        int i;
+
+        printf( "%08x:", (unsigned) base );
+
+        for ( i = 0; i < 8; ++i ) {
+          printf( " %08x",
+                  (unsigned) *(volatile uint32_t *) (uintptr_t)
+                    ( base + i * 4 ) );
+        }
+
+        printf( "\n" );
+      }
+    }
+#endif
 
 #ifdef WIFI_NET_MAC_FINGERPRINT
     /*
