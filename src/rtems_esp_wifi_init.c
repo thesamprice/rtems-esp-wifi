@@ -188,6 +188,143 @@ static bool rtems_wifi_inited;
  */
 static esp_phy_calibration_data_t rtems_wifi_cal_data;
 
+/* === the modem power domain ============================================= */
+
+/*
+ * Powering the radio up, which ESP-IDF does in esp_wifi_init() and this port
+ * did not.
+ *
+ * It was skipped because esp_wifi_power_domain_on() lives in esp_phy, which is
+ * not built here, and because nothing in QEMU noticed: every register below is
+ * answered by the machine's catch-all regardless of whether anything was
+ * written to it, so calibration converged in emulation with the radio still
+ * powered down and isolated.
+ *
+ * On silicon it does not.  The first hardware run hung in ram_iq_est_enable's
+ * convergence loop -- reading a measurement, shifting right 12, masking seven
+ * bits, and looping while it stayed below a threshold -- until the timer
+ * group 0 watchdog reset the part, about once a second, forever.  The IQ
+ * estimate cannot converge on analog blocks that have no power.
+ *
+ * The sequence is esp_phy/src/phy_init.c's esp_wifi_bt_power_domain_on(), with
+ * the reference counting and the lock removed: this port brings the radio up
+ * once and never takes it down, so there is nothing to count.
+ */
+
+/*
+ * These duplicate the accessors and SYSCON addresses in
+ * src/rtems_wifi_os_adapter.c, which has its own for the clock and reset
+ * entries of the OS adapter table.  Sharing them would mean a header for two
+ * inline functions and four constants, and putting the power-domain sequence
+ * in the adapter would be worse -- it is not an OS primitive, it is part of
+ * bringing the radio up, which is what this file is.
+ */
+static inline uint32_t rtems_wifi_reg_read( uint32_t addr )
+{
+  return *(volatile uint32_t *) (uintptr_t) addr;
+}
+
+static inline void rtems_wifi_reg_write( uint32_t addr, uint32_t value )
+{
+  *(volatile uint32_t *) (uintptr_t) addr = value;
+}
+
+#define RTEMS_WIFI_SYSCON_BASE        0x60026000u
+#define RTEMS_WIFI_CLK_EN_REG         ( RTEMS_WIFI_SYSCON_BASE + 0x014u )
+#define RTEMS_WIFI_RST_EN_REG         ( RTEMS_WIFI_SYSCON_BASE + 0x018u )
+
+/* soc/esp32c3/register/soc/rtc_cntl_reg.h */
+#define RTEMS_WIFI_RTC_BASE           0x60008000u
+#define RTEMS_WIFI_RTC_DIG_PWC_REG    ( RTEMS_WIFI_RTC_BASE + 0x0088u )
+#define RTEMS_WIFI_RTC_WIFI_FORCE_PD  ( 1u << 17 )
+#define RTEMS_WIFI_RTC_DIG_ISO_REG    ( RTEMS_WIFI_RTC_BASE + 0x008Cu )
+#define RTEMS_WIFI_RTC_WIFI_FORCE_ISO ( 1u << 28 )
+
+/* syscon_reg.h: SYSTEM_WIFI_CLK_WIFI_BT_COMMON_M, and MODEM_RESET_FIELD_WHEN_PU
+ * spelled out because the header composes it from ten BT and WiFi bits. */
+#define RTEMS_WIFI_CLK_BT_COMMON_M    0x78078Fu
+#define RTEMS_WIFI_CLK_PHY_EN_M       0x400000u
+#define RTEMS_WIFI_MODEM_RESET_WHEN_PU                                        \
+  ( ( 1u << 0 ) | ( 1u << 1 ) | ( 1u << 2 ) | ( 1u << 3 ) |                    \
+    ( 1u << 4 ) | ( 1u << 9 ) | ( 1u << 11 ) | ( 1u << 13 ) )
+
+static void rtems_esp_wifi_power_domain_on( void )
+{
+  uint32_t reg;
+
+  /* Out of power-down. */
+  reg = rtems_wifi_reg_read( RTEMS_WIFI_RTC_DIG_PWC_REG );
+  rtems_wifi_reg_write( RTEMS_WIFI_RTC_DIG_PWC_REG,
+                        reg & ~RTEMS_WIFI_RTC_WIFI_FORCE_PD );
+
+  /*
+   * ESP-IDF waits 10us here for the rails to come up before touching the
+   * modem.  rtems_task_wake_after() cannot express that -- it would round to a
+   * whole tick, which is 10ms and would also yield -- and this runs before the
+   * radio exists, so a busy wait is both correct and cheap.  The systimer is
+   * already running; one tick of it is well under a microsecond.
+   */
+  {
+    uint64_t start = rtems_clock_get_uptime_nanoseconds();
+
+    while ( rtems_clock_get_uptime_nanoseconds() - start < 10000u ) {
+      /* wait */
+    }
+  }
+
+  /* The common clock has to be on across the reset pulse. */
+  reg = rtems_wifi_reg_read( RTEMS_WIFI_CLK_EN_REG );
+  rtems_wifi_reg_write( RTEMS_WIFI_CLK_EN_REG,
+                        reg | RTEMS_WIFI_CLK_BT_COMMON_M );
+
+  /* Reset the modem now it has power: assert, then release. */
+  reg = rtems_wifi_reg_read( RTEMS_WIFI_RST_EN_REG );
+  rtems_wifi_reg_write( RTEMS_WIFI_RST_EN_REG,
+                        reg | RTEMS_WIFI_MODEM_RESET_WHEN_PU );
+  rtems_wifi_reg_write( RTEMS_WIFI_RST_EN_REG,
+                        reg & ~RTEMS_WIFI_MODEM_RESET_WHEN_PU );
+
+  /* Out of isolation.  Order matters: power, then reset, then this. */
+  reg = rtems_wifi_reg_read( RTEMS_WIFI_RTC_DIG_ISO_REG );
+  rtems_wifi_reg_write( RTEMS_WIFI_RTC_DIG_ISO_REG,
+                        reg & ~RTEMS_WIFI_RTC_WIFI_FORCE_ISO );
+
+  /*
+   * The common clock goes back OFF here to match ESP-IDF's power-domain
+   * function, which toggles it only around the reset pulse.  It is turned on
+   * again for good in rtems_esp_wifi_clocks_on() below -- keeping the two
+   * separate because they are separate steps upstream and conflating them
+   * hides that the PHY needs a clock the power-up sequence does not leave on.
+   */
+  reg = rtems_wifi_reg_read( RTEMS_WIFI_CLK_EN_REG );
+  rtems_wifi_reg_write( RTEMS_WIFI_CLK_EN_REG,
+                        reg & ~RTEMS_WIFI_CLK_BT_COMMON_M );
+}
+
+/*
+ * The clocks register_chipv7_phy() needs, and which nothing else turns on.
+ *
+ * ESP-IDF does this in esp_phy_enable(): esp_phy_common_clock_enable() then
+ * phy_module_enable(), both left ON, immediately before
+ * esp_phy_load_cal_and_init() reaches register_chipv7_phy().  There is even an
+ * assert between them -- phy_module_has_clock_bits() -- which is upstream
+ * saying that calibrating without these is a programming error rather than a
+ * degraded mode.
+ *
+ * This port skipped both, and QEMU did not care: the analog registers answer
+ * whether or not anything is clocked.  Silicon does care, and the symptom is
+ * ram_iq_est_enable spinning in its convergence loop until a watchdog fires.
+ */
+static void rtems_esp_wifi_clocks_on( void )
+{
+  uint32_t reg = rtems_wifi_reg_read( RTEMS_WIFI_CLK_EN_REG );
+
+  rtems_wifi_reg_write(
+    RTEMS_WIFI_CLK_EN_REG,
+    reg | RTEMS_WIFI_CLK_BT_COMMON_M | RTEMS_WIFI_CLK_PHY_EN_M
+  );
+}
+
 esp_err_t esp_wifi_init( const wifi_init_config_t *config )
 {
   esp_err_t result;
@@ -219,6 +356,15 @@ esp_err_t esp_wifi_init( const wifi_init_config_t *config )
   }
 
   rtems_esp_wifi_copy_sections();
+
+  /*
+   * Before the PHY, not after.  register_chipv7_phy() calibrates against the
+   * analog blocks, and on silicon they have to be powered and out of isolation
+   * first or the calibration loops never converge.
+   */
+  printk( "rtems-esp-wifi: powering the modem domain...\n" );
+  rtems_esp_wifi_power_domain_on();
+  rtems_esp_wifi_clocks_on();
 
   esp_wifi_set_sleep_min_active_time( RTEMS_WIFI_MIN_ACTIVE_TIME_US );
   esp_wifi_set_keep_alive_time( RTEMS_WIFI_KEEP_ALIVE_TIME_US );
