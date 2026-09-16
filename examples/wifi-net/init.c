@@ -91,6 +91,14 @@ static void check( const char *what, bool ok )
  */
 #define DHCP_WAIT_SECONDS 20
 
+/* Where WIFI_NET_UDP_PROBE shouts, and how many times. */
+#ifndef WIFI_NET_UDP_PROBE_PORT
+#define WIFI_NET_UDP_PROBE_PORT 47777
+#endif
+#ifndef WIFI_NET_UDP_PROBE_COUNT
+#define WIFI_NET_UDP_PROBE_COUNT 20
+#endif
+
 #define STA_IP_A 10
 #define STA_IP_B 0
 #define STA_IP_C 2
@@ -612,6 +620,31 @@ static rtems_task Init( rtems_task_argument arg )
          sta_connected_seen > 0 || sta_disconnected_seen > 0 );
 
   /*
+   * What was actually negotiated, when there is an association to ask about.
+   *
+   * esp_wifi_sta_get_ap_info() reports the ciphers the station and the access
+   * point agreed on, which is worth having in the log next to a run where
+   * transmit is accepted by the driver and nothing arrives: a pairwise cipher
+   * of WIFI_CIPHER_TYPE_CCMP means the RSN negotiation completed and the data
+   * path is expected to be encrypted, and it narrows the remaining question to
+   * whether the key reached the hardware.
+   */
+  if ( sta_connected_seen > 0 ) {
+    wifi_ap_record_t ap;
+
+    if ( esp_wifi_sta_get_ap_info( &ap ) == ESP_OK ) {
+      printf( "       associated to '%s' ch %u rssi %i\n",
+              (const char *) ap.ssid, (unsigned) ap.primary, (int) ap.rssi );
+      printf( "       authmode %u  pairwise cipher %u  group cipher %u\n",
+              (unsigned) ap.authmode,
+              (unsigned) ap.pairwise_cipher,
+              (unsigned) ap.group_cipher );
+    } else {
+      printf( "       esp_wifi_sta_get_ap_info failed\n" );
+    }
+  }
+
+  /*
    * DHCP, but only if the station actually associated.
    *
    * Gated on the event rather than on a build-time flag, because the event is
@@ -675,6 +708,70 @@ static rtems_task Init( rtems_task_argument arg )
             ip4addr_ntoa( netif_ip4_netmask( &net_interface ) ) );
     printf( "       gateway %s\n",
             ip4addr_ntoa( netif_ip4_gw( &net_interface ) ) );
+
+#ifdef WIFI_NET_UDP_PROBE
+    /*
+     * Shout onto the LAN, so another host can say whether we are audible.
+     *
+     * Everything measured so far is from this station's own point of view, and
+     * none of it separates the two remaining possibilities: either our data
+     * frames never reach the access point -- accepted by the driver, encrypted
+     * with a key the AP does not share, and silently discarded -- or they do
+     * and the replies are being kept somewhere above the MAC.  A second
+     * machine on the same network settles it in one run.  If the datagrams
+     * arrive there, transmit works end to end and the fault is receive; if
+     * they do not, it is transmit, and the DHCP silence is a consequence
+     * rather than the problem.
+     *
+     * A chosen port rather than DHCP's own: port 68 needs privileges on the
+     * listening side, and the point is a test anyone can run.
+     *
+     * The source address is wrong for that network -- it is the static one
+     * compiled in above, since DHCP did not answer -- and that does not
+     * matter.  Delivery here is layer 2: the access point bridges a broadcast
+     * frame to the LAN whatever the IP header claims.
+     */
+    {
+      int s = socket( AF_INET, SOCK_DGRAM, 0 );
+
+      if ( s >= 0 ) {
+        struct sockaddr_in to;
+        int                on = 1;
+        int                i;
+
+        setsockopt( s, SOL_SOCKET, SO_BROADCAST, &on, sizeof( on ) );
+
+        memset( &to, 0, sizeof( to ) );
+        to.sin_family      = AF_INET;
+        to.sin_port        = htons( WIFI_NET_UDP_PROBE_PORT );
+        to.sin_addr.s_addr = htonl( INADDR_BROADCAST );
+
+        printf( "sending %d UDP broadcasts to port %d...\n",
+                WIFI_NET_UDP_PROBE_COUNT, WIFI_NET_UDP_PROBE_PORT );
+
+        for ( i = 0; i < WIFI_NET_UDP_PROBE_COUNT; ++i ) {
+          char msg[ 64 ];
+          int  n = snprintf( msg, sizeof( msg ),
+                             "rtems-esp32c3 %02x:%02x:%02x:%02x:%02x:%02x #%d",
+                             net_interface.hwaddr[ 0 ], net_interface.hwaddr[ 1 ],
+                             net_interface.hwaddr[ 2 ], net_interface.hwaddr[ 3 ],
+                             net_interface.hwaddr[ 4 ], net_interface.hwaddr[ 5 ],
+                             i );
+
+          if ( sendto( s, msg, (size_t) n, 0,
+                       (struct sockaddr *) &to, sizeof( to ) ) < 0 ) {
+            printf( "       sendto %d failed\n", i );
+          }
+
+          rtems_task_wake_after( rtems_clock_get_ticks_per_second() / 2 );
+        }
+
+        close( s );
+        printf( "       sent; tx_frames now %u\n",
+                (unsigned) stats->tx_frames );
+      }
+    }
+#endif
 
 #ifdef WIFI_NET_PROMISC_PROBE
     if ( stats->rx_frames == 0 ) {
