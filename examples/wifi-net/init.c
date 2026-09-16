@@ -126,6 +126,8 @@ static volatile unsigned promisc_data;
  */
 static volatile unsigned promisc_to_us;
 static volatile unsigned promisc_data_to_us;
+static volatile unsigned promisc_data_bcast;
+static volatile unsigned promisc_data_prot;
 
 /*
  * addr1 of an 802.11 header is the receiver address, and it is the only field
@@ -163,6 +165,24 @@ static void promisc_cb( void *buf, wifi_promiscuous_pkt_type_t type )
 
     if ( to_us ) {
       ++promisc_data_to_us;
+    }
+
+    /*
+     * Broadcast counts separately because a DHCP offer usually is one, and
+     * because broadcast data is encrypted with the group key rather than the
+     * pairwise key -- so "plenty of broadcast data on the air, none of it
+     * reaching the interface" and "nothing addressed to us at all" point at
+     * different halves of the problem.
+     */
+    if ( pkt->payload[ 4 ] == 0xff && pkt->payload[ 5 ] == 0xff &&
+         pkt->payload[ 6 ] == 0xff && pkt->payload[ 7 ] == 0xff &&
+         pkt->payload[ 8 ] == 0xff && pkt->payload[ 9 ] == 0xff ) {
+      ++promisc_data_bcast;
+    }
+
+    /* Frame control bit 14 is Protected: the frame body is encrypted. */
+    if ( ( pkt->payload[ 1 ] & 0x40u ) != 0u ) {
+      ++promisc_data_prot;
     }
   }
 }
@@ -267,6 +287,35 @@ static void on_wifi_event(
     default: break;
   }
 }
+
+#ifdef WIFI_NET_KEY_DELTA
+/*
+ * The MAC's key-slot region, printed with a tag so two dumps can be diffed.
+ *
+ * Taken before esp_wifi_connect() and again after the four-way handshake has
+ * reported both keys installed.  If the words that should hold key material
+ * are the same in both, the install never reached the hardware -- and that
+ * needs no comparison against another image to interpret, which is what makes
+ * it worth doing after so much A/B.
+ */
+static void dump_key_region( const char *tag )
+{
+  uint32_t base;
+
+  for ( base = 0x60034000u; base < 0x60036000u; base += 32u ) {
+    int i;
+
+    printf( "KEY %s %08x:", tag, (unsigned) base );
+
+    for ( i = 0; i < 8; ++i ) {
+      printf( " %08x",
+              (unsigned) *(volatile uint32_t *) (uintptr_t) ( base + i * 4 ) );
+    }
+
+    printf( "\n" );
+  }
+}
+#endif
 
 static void print_mac( const char *what, const uint8_t mac[ 6 ] )
 {
@@ -619,6 +668,10 @@ static rtems_task Init( rtems_task_argument arg )
   printf( "esp_wifi_set_ps(WIFI_PS_NONE) returned %i\n", (int) rv );
   check( "power save could be turned off", rv == ESP_OK );
 
+#ifdef WIFI_NET_KEY_DELTA
+  dump_key_region( "before" );
+#endif
+
   printf( "calling esp_wifi_connect to %s...\n", WIFI_NET_SSID );
   rv = esp_wifi_connect();
   printf( "esp_wifi_connect returned %i\n", (int) rv );
@@ -717,6 +770,38 @@ static rtems_task Init( rtems_task_argument arg )
   printf( "esp_wifi_internal_set_fix_rate(1M) returned %i\n", (int) rv );
 #endif
 
+#ifdef WIFI_NET_PROMISC_PROBE
+  /*
+   * Listen on the air straight after associating, before DHCP.
+   *
+   * The first run of this was taken after the DHCP wait had already expired,
+   * by which time lwIP had backed off and an idle station legitimately hears
+   * nothing addressed to it -- so "zero frames to this station" was measured at
+   * the wrong moment and did not support the conclusion drawn from it.  Here it
+   * runs while there is traffic to hear.
+   */
+  if ( sta_connected_seen > 0 ) {
+    printf( "listening on the air for 8s...\n" );
+
+    if ( esp_wifi_set_promiscuous_rx_cb( promisc_cb ) == ESP_OK &&
+         esp_wifi_set_promiscuous( true ) == ESP_OK ) {
+      rtems_task_wake_after( 8 * rtems_clock_get_ticks_per_second() );
+      ( void ) esp_wifi_set_promiscuous( false );
+    }
+
+    printf( "       heard %u frames, %u data\n",
+            promisc_frames, promisc_data );
+    printf( "       data to this station %u, broadcast %u, protected %u\n",
+            promisc_data_to_us, promisc_data_bcast, promisc_data_prot );
+  }
+#endif
+
+#ifdef WIFI_NET_KEY_DELTA
+  if ( sta_connected_seen > 0 ) {
+    dump_key_region( "after " );
+  }
+#endif
+
   /*
    * Install the receive path again, now that the station has associated.
    *
@@ -813,7 +898,7 @@ static rtems_task Init( rtems_task_argument arg )
 
       printf( "--- MAC words 0x60033c00..0x60033dfc ---\n" );
 
-      for ( base = 0x60033c00u; base < 0x60033e00u; base += 32u ) {
+      for ( base = 0x60034000u; base < 0x60036000u; base += 32u ) {
         int i;
 
         printf( "%08x:", (unsigned) base );
