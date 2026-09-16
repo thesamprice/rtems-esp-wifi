@@ -92,6 +92,26 @@
 #define CONFIG_LOG_DEFAULT_LEVEL 3
 
 /*
+ * The compile-time ceiling.  esp_log_level.h wants both: DEFAULT is the level
+ * a tag starts at, MAXIMUM is the one above which ESP_LOGx compiles to
+ * nothing at all.  Only the supplicant needs it, and only once it is built
+ * with DEBUG_PRINT -- without that, wpa_printf() expands to do {} while (0)
+ * and neither symbol is ever referenced, which is why this was missing for so
+ * long and why its absence surfaced as 19 of 48 files failing to compile the
+ * moment the supplicant was asked to say anything.
+ */
+#define CONFIG_LOG_MAXIMUM_LEVEL 3
+
+/*
+ * Log API version 2, which is the one whose ESP_LOG_LEVEL reduces to a single
+ * esp_log() call.  Version 1 expands into a chain that wants
+ * CONFIG_LOG_TIMESTAMP_SOURCE_* and LOG_FORMAT as well, none of which this
+ * port has; undefined, ESP_LOG_VERSION reads as 0 and takes the version 1
+ * branch.
+ */
+#define CONFIG_LOG_VERSION 2
+
+/*
  * Buffer counts, all named by WIFI_INIT_CONFIG_DEFAULT() in esp_wifi.h.
  *
  * These are the branch's own Kconfig defaults, read out of

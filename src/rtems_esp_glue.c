@@ -39,6 +39,8 @@
 #include <rtems.h>
 #include <rtems/bspIo.h>
 
+#include <esp_log.h>
+
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -269,4 +271,48 @@ void vTaskDelay( TickType_t ticks )
   (void) rtems_task_wake_after(
     ticks == 0 ? RTEMS_YIELD_PROCESSOR : (rtems_interval) ticks
   );
+}
+
+/*
+ * esp_log(), which is where every ESP_LOGx in ESP-IDF source ends up.
+ *
+ * Distinct from the WiFi OS adapter's _log_write: that one is how the
+ * *binary* libraries report, and this is how everything built from source
+ * does -- most importantly the supplicant, whose wpa_printf() expands to
+ * ESP_LOG_LEVEL_LOCAL and so to this.  Without it the supplicant is silent
+ * about a failing handshake, which is the one thing worth hearing about.
+ *
+ * Filtered for the same reason the other one is.  printk drains the console
+ * synchronously, and on a USB-Serial-JTAG console the volume at INFO and below
+ * is enough to make the four-way handshake miss its timing: the run then
+ * disconnects with WIFI_REASON_ASSOC_EXPIRE, and the logging that was meant to
+ * explain the failure is the failure.  Errors and warnings are rare enough to
+ * be safe.
+ */
+#ifndef RTEMS_ESP_LOG_LEVEL
+#define RTEMS_ESP_LOG_LEVEL 2
+#endif
+
+void esp_log(
+  esp_log_config_t config,
+  const char      *tag,
+  const char      *format,
+  ...
+)
+{
+  va_list args;
+
+  if ( (unsigned) config.opts.log_level > RTEMS_ESP_LOG_LEVEL ) {
+    return;
+  }
+
+  if ( tag != NULL ) {
+    printk( "%s: ", tag );
+  }
+
+  va_start( args, format );
+  vprintk( format, args );
+  va_end( args );
+
+  printk( "\n" );
 }

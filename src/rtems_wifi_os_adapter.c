@@ -1791,27 +1791,74 @@ static int rtems_wifi_stub_nvs_erase_key( uint32_t handle, const char* key )
   return ESP_FAIL;
 }
 
-static void rtems_wifi_stub_log_write( unsigned int level, const char* tag, const char* format, ... )
+/*
+ * The libraries' own logging, which used to be discarded.
+ *
+ * These three were stubs, and a stub here is worse than it looks.  Everything
+ * libnet80211, libpp and the supplicant have to say about why something did
+ * not work -- an association rejected, a handshake that timed out, a frame
+ * dropped for a reason they know and we do not -- went to
+ * RTEMS_WIFI_UNIMPLEMENTED and was lost, so a port that is being brought up
+ * against real hardware had its single best diagnostic switched off.
+ *
+ * printk rather than printf: this is called from the WiFi task and from
+ * contexts with interrupts disabled, where printf's locking is not safe, and
+ * the whole point is to survive the failure being reported.
+ *
+ * Filtered, and the filter is not cosmetic.  ESP_LOG_NONE is 0 and the levels
+ * rise to ESP_LOG_VERBOSE at 5; the libraries emit a great deal at INFO and
+ * below, and printk goes out of a USB-Serial-JTAG console synchronously.
+ * Printing all of it during association breaks the association: the run
+ * disconnects with reason 4, WIFI_REASON_ASSOC_EXPIRE, because the handshake
+ * misses its timing while the console drains.  Errors and warnings are rare
+ * enough not to, and they are the ones worth having.
+ *
+ * Raise it with -DRTEMS_WIFI_LOG_LEVEL=<n> when chasing something specific,
+ * and expect the timing cost above at INFO and beyond.
+ */
+#ifndef RTEMS_WIFI_LOG_LEVEL
+#define RTEMS_WIFI_LOG_LEVEL 2
+#endif
+static void rtems_wifi_log_writev(
+  unsigned int level,
+  const char  *tag,
+  const char  *format,
+  va_list      args
+)
 {
-  (void) level;
-  (void) tag;
-  (void) format;
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_log" );
+  if ( level > RTEMS_WIFI_LOG_LEVEL ) {
+    return;
+  }
+
+  if ( tag != NULL ) {
+    printk( "wifi.%s: ", tag );
+  }
+
+  vprintk( format, args );
 }
 
-static void rtems_wifi_stub_log_writev( unsigned int level, const char* tag, const char* format, va_list args )
+static void rtems_wifi_log_write(
+  unsigned int level,
+  const char  *tag,
+  const char  *format,
+  ...
+)
 {
-  (void) level;
-  (void) tag;
-  (void) format;
-  (void) args;
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_log" );
+  va_list args;
+
+  va_start( args, format );
+  rtems_wifi_log_writev( level, tag, format, args );
+  va_end( args );
 }
 
-static uint32_t rtems_wifi_stub_log_timestamp( void )
+/*
+ * Milliseconds since boot, which is what esp_log_timestamp() returns and what
+ * the libraries' own format strings expect.
+ */
+static uint32_t rtems_wifi_log_timestamp( void )
 {
-  RTEMS_WIFI_UNIMPLEMENTED( "esp_log" );
-  return 0;
+  return (uint32_t)
+    ( rtems_clock_get_uptime_nanoseconds() / 1000000u );
 }
 
 static void rtems_wifi_stub_coex_condition_set( uint32_t type, bool dissatisfy )
@@ -1990,9 +2037,9 @@ wifi_osi_funcs_t g_wifi_osi_funcs = {
   ._get_time = rtems_wifi_get_time,
   ._random = rtems_wifi_random,
   ._slowclk_cal_get = rtems_wifi_slowclk_cal_get,
-  ._log_write = rtems_wifi_stub_log_write,
-  ._log_writev = rtems_wifi_stub_log_writev,
-  ._log_timestamp = rtems_wifi_stub_log_timestamp,
+  ._log_write = rtems_wifi_log_write,
+  ._log_writev = rtems_wifi_log_writev,
+  ._log_timestamp = rtems_wifi_log_timestamp,
   ._malloc_internal = rtems_wifi_malloc,
   ._realloc_internal = rtems_wifi_realloc,
   ._calloc_internal = rtems_wifi_calloc,

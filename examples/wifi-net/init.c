@@ -44,11 +44,20 @@
  * libraries what they think of a transmit rather than only counting that they
  * refused one. */
 #include <esp_private/wifi.h>
+/*
+ * wifi_promiscuous_pkt_t lives here rather than in esp_wifi_types.h.  It is
+ * the per-chip half of the types header, and it has to be: wifi_pkt_rx_ctrl_t
+ * is 48 bytes on the C3 against 28 on the original ESP32, so a payload offset
+ * taken from the wrong one lands in the middle of the metadata.
+ */
+#include <esp_wifi_types_native.h>
 
 /* start_networking(), from the BSP's installed rtems-lwip headers. */
 #include <netstart.h>
 
+#include <lwip/dhcp.h>
 #include <lwip/netif.h>
+#include <lwip/netifapi.h>
 #include <lwip/pbuf.h>
 #include <lwip/sockets.h>
 
@@ -75,12 +84,81 @@ static void check( const char *what, bool ok )
  * static address means no check below depends on a DHCP server answering, and
  * it keeps the two lwIP examples in this tree describing the same network.
  */
+/*
+ * How long to wait for a DHCP lease once associated.  Generous: a sleeping
+ * access point can take several seconds to answer a discover, and the cost of
+ * being wrong here is a spurious failure on a working network.
+ */
+#define DHCP_WAIT_SECONDS 20
+
 #define STA_IP_A 10
 #define STA_IP_B 0
 #define STA_IP_C 2
 #define STA_IP_D 15
 
 static struct netif net_interface;
+
+#ifdef WIFI_NET_PROMISC_PROBE
+static volatile unsigned promisc_frames;
+static volatile unsigned promisc_data;
+
+/*
+ * Counts everything the radio hears while associated.
+ *
+ * It answers one question that the netif counters cannot: rx_frames 0 with
+ * every rx_dropped_* also 0 means our callback was never called, and that is
+ * equally what "the radio hears nothing" and "the radio hears plenty and the
+ * libraries keep all of it" look like.  Promiscuous mode sits below the
+ * filtering and the decryption, so a non-zero count here puts the fault above
+ * the MAC and a zero one puts it below.
+ *
+ * The data subtype is counted separately because that is the interesting one.
+ * Beacons prove the receive chain works at all -- the scan already did -- but
+ * only data frames can become a DHCP offer.
+ */
+static volatile unsigned promisc_to_us;
+static volatile unsigned promisc_data_to_us;
+
+/*
+ * addr1 of an 802.11 header is the receiver address, and it is the only field
+ * that answers the question that matters here: is the access point sending
+ * anything to this station at all?
+ *
+ * "No frames reach the netif" has two causes that look identical from the
+ * netif side and want opposite fixes.  Either the access point is not
+ * transmitting to us -- our own transmits are being accepted by the driver and
+ * going nowhere, so nothing is ever answered -- or it is transmitting and the
+ * libraries are keeping every frame, which would point at decryption.
+ * Counting by receiver address separates them.
+ *
+ * The header starts at payload: frame control (2), duration (2), then addr1.
+ */
+static void promisc_cb( void *buf, wifi_promiscuous_pkt_type_t type )
+{
+  const wifi_promiscuous_pkt_t *pkt = buf;
+  bool                          to_us;
+
+  ++promisc_frames;
+
+  if ( pkt == NULL ) {
+    return;
+  }
+
+  to_us = memcmp( pkt->payload + 4, net_interface.hwaddr, 6 ) == 0;
+
+  if ( to_us ) {
+    ++promisc_to_us;
+  }
+
+  if ( type == WIFI_PKT_DATA ) {
+    ++promisc_data;
+
+    if ( to_us ) {
+      ++promisc_data_to_us;
+    }
+  }
+}
+#endif
 
 /*
  * start_networking() takes one and the ESP32-C3 ignores it: a station's MAC
@@ -275,10 +353,20 @@ static rtems_task Init( rtems_task_argument arg )
   uint8_t                      wifi_mac[ 6 ];
   const rtems_esp_netif_stats *stats;
   uint32_t                     tx_before;
-  err_t                        err_single, err_chained;
+  err_t                        err_single, err_chained, err;
   int                          sock;
 
   (void) arg;
+
+  /*
+   * Fetched here rather than beside its first use further down.  It is a
+   * pointer to a static counter block in the port, so it is valid before
+   * anything is initialised -- and the "goto done" on an esp_wifi_init()
+   * failure jumps straight past the assignment that used to be the only one,
+   * into a block that dereferences it.  That path has never been taken, which
+   * is the only reason it has not crashed.
+   */
+  stats = rtems_esp_netif_get_stats();
 
   printf( "\n*** ESP32-C3 WIFI + LWIP TEST ***\n" );
 
@@ -486,6 +574,24 @@ static rtems_task Init( rtems_task_argument arg )
     check( "the scan was accepted", rv == ESP_OK );
   }
 
+  /*
+   * Power save off, before associating.
+   *
+   * ESP-IDF defaults a station to WIFI_PS_MIN_MODEM: the radio sleeps between
+   * DTIMs and wakes in time for the next beacon.  That needs the sleep side of
+   * the OS adapter to work, and on this port it does not -- see the named
+   * failures in rtems_wifi_os_adapter.c.  What that looks like from outside is
+   * an association that succeeds and then goes deaf:
+   * WIFI_EVENT_STA_BEACON_TIMEOUT arrives a few seconds later, DHCP discovers
+   * go out and nothing ever comes back, and the counters show transmit working
+   * and rx_frames stuck at 0.
+   *
+   * Has to be after esp_wifi_start(); ESP-IDF rejects it before.
+   */
+  rv = esp_wifi_set_ps( WIFI_PS_NONE );
+  printf( "esp_wifi_set_ps(WIFI_PS_NONE) returned %i\n", (int) rv );
+  check( "power save could be turned off", rv == ESP_OK );
+
   printf( "calling esp_wifi_connect to %s...\n", WIFI_NET_SSID );
   rv = esp_wifi_connect();
   printf( "esp_wifi_connect returned %i\n", (int) rv );
@@ -506,11 +612,93 @@ static rtems_task Init( rtems_task_argument arg )
          sta_connected_seen > 0 || sta_disconnected_seen > 0 );
 
   /*
+   * DHCP, but only if the station actually associated.
+   *
+   * Gated on the event rather than on a build-time flag, because the event is
+   * the condition that makes the difference.  A station that associated is on
+   * somebody else's network and the address compiled in above is almost
+   * certainly wrong for it; a station that did not has nothing to ask.  QEMU
+   * has no DHCP server and never reaches WIFI_EVENT_STA_CONNECTED, so it keeps
+   * the static address and the behaviour it had before, and the branch below
+   * is hardware-only without needing to say so.
+   *
+   * netifapi_dhcp_start() rather than dhcp_start().  dhcp_start() is core work
+   * -- it rewrites the netif's addresses and arms timeouts -- and this runs on
+   * Init, not the tcpip thread.  The netifapi wrapper does the handover.
+   *
+   * This is also what finally exercises receiving for real.  The scan proved
+   * beacons arrive, but a beacon is consumed inside libnet80211 and never
+   * reaches this layer; a DHCP offer is addressed to this station and comes up
+   * through esp32c3_netif_input(), which is the first frame to cross the eb
+   * boundary on hardware and the first time the ownership contract below is
+   * tested by anything other than QEMU.
+   */
+  if ( sta_connected_seen > 0 ) {
+    unsigned waited;
+
+    printf( "associated; starting DHCP...\n" );
+
+    err = netifapi_dhcp_start( &net_interface );
+    printf( "netifapi_dhcp_start returned %i\n", (int) err );
+    check( "DHCP started", err == ERR_OK );
+
+    /*
+     * Polled rather than waited on.  A netif status callback would need to
+     * hand the result back across threads for no gain here: the run has
+     * nothing else to do until an address arrives, and a poll makes the
+     * timeout explicit.
+     */
+    for ( waited = 0; waited < DHCP_WAIT_SECONDS; ++waited ) {
+      if ( dhcp_supplied_address( &net_interface ) ) {
+        break;
+      }
+
+      rtems_task_wake_after( rtems_clock_get_ticks_per_second() );
+    }
+
+    /*
+     * A real failure, not a "did not happen".  Reaching here means the station
+     * is associated to an access point, so a network that does not answer a
+     * discover in this long is worth reporting as broken rather than shrugged
+     * at -- and it is the only way this example can tell "associated" from
+     * "usable".
+     */
+    check( "DHCP bound an address", dhcp_supplied_address( &net_interface ) );
+
+    /*
+     * One call per line: ip4addr_ntoa() returns a pointer to a single static
+     * buffer, so two of them in one printf both show the second address.
+     */
+    printf( "       address %s\n",
+            ip4addr_ntoa( netif_ip4_addr( &net_interface ) ) );
+    printf( "       netmask %s\n",
+            ip4addr_ntoa( netif_ip4_netmask( &net_interface ) ) );
+    printf( "       gateway %s\n",
+            ip4addr_ntoa( netif_ip4_gw( &net_interface ) ) );
+
+#ifdef WIFI_NET_PROMISC_PROBE
+    if ( stats->rx_frames == 0 ) {
+      printf( "no frames reached the netif; counting what the radio hears\n" );
+
+      if ( esp_wifi_set_promiscuous_rx_cb( promisc_cb ) == ESP_OK &&
+           esp_wifi_set_promiscuous( true ) == ESP_OK ) {
+        rtems_task_wake_after( 5 * rtems_clock_get_ticks_per_second() );
+        ( void ) esp_wifi_set_promiscuous( false );
+      }
+
+      printf( "       promiscuous heard %u frames, %u of them data\n",
+              promisc_frames, promisc_data );
+      printf( "       addressed to this station: %u frames, %u of them data\n",
+              promisc_to_us, promisc_data_to_us );
+    }
+#endif
+  }
+
+  /*
    * Transmit.  Both shapes, because the chained one is the only path through
    * the staging buffer.  Refusal is expected and is not counted as a failure:
    * the station has not associated with anything.
    */
-  stats = rtems_esp_netif_get_stats();
   tx_before = stats->tx_frames + stats->tx_dropped_driver;
 
   err_single = transmit_one( &net_interface, false );
@@ -605,6 +793,20 @@ done:
       (unsigned) stats->rx_frames
     );
   }
+
+  /*
+   * Asserted, not just narrated.  Every paragraph above has described this
+   * contract and nothing has ever checked it, which is the failure mode #98
+   * is about: a check that reads as a result and is not one.
+   *
+   * It holds vacuously while rx_frames is 0 -- which is why the explanation
+   * above distinguishes the two cases -- but it is cheap and it is exactly the
+   * assertion that has to be in place before the first frame arrives, not
+   * after.  Leaking an eb handle is not an error at the time: it is a radio
+   * that goes quiet once the RX pool is gone, a long way from here.
+   */
+  check( "every eb handle the driver lent us was given back",
+         stats->eb_taken == stats->eb_released );
 
   printf( "\n%d failure(s)\n", failures );
 
