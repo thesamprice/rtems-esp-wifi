@@ -141,7 +141,6 @@ static void on_wifi_event(
 )
 {
   (void) arg;
-  (void) data;
 
   printf( "       event: %s id %i\n", base, (int) id );
 
@@ -157,7 +156,28 @@ static void on_wifi_event(
   switch ( id ) {
     case WIFI_EVENT_STA_START:        ++sta_start_seen;        break;
     case WIFI_EVENT_STA_CONNECTED:    ++sta_connected_seen;    break;
-    case WIFI_EVENT_STA_DISCONNECTED: ++sta_disconnected_seen; break;
+    case WIFI_EVENT_STA_DISCONNECTED:
+      ++sta_disconnected_seen;
+
+      /*
+       * The reason, not just the count.  "Disconnected" on its own does not
+       * say whether the access point was never seen, refused the credentials,
+       * or dropped the association later, and those want three different
+       * things done about them.  The common ones on a first attempt are
+       * WIFI_REASON_NO_AP_FOUND (201), which on this chip usually means the
+       * network is 5GHz and the C3 is 2.4GHz only, and
+       * WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT (15), which means the passphrase
+       * was wrong.
+       */
+      if ( data != NULL ) {
+        const wifi_event_sta_disconnected_t *d = data;
+
+        printf( "       disconnected: reason %i, rssi %i, ssid '%.*s'\n",
+                (int) d->reason, (int) d->rssi,
+                (int) d->ssid_len, (const char *) d->ssid );
+      }
+
+      break;
     default: break;
   }
 }
@@ -406,6 +426,66 @@ static rtems_task Init( rtems_task_argument arg )
    * correctly, because without a connection attempt there is no BSS a data
    * frame could belong to.
    */
+  /*
+   * Scan before connecting, and print what is out there.
+   *
+   * A disconnect with WIFI_REASON_NO_AP_FOUND has two very different causes
+   * and the reason code cannot tell them apart: either the receive path does
+   * not work and the station hears nothing at all, or it works and the
+   * network asked for is genuinely not on the air.  A list of everything
+   * heard separates them in one run.
+   *
+   * It is also the first thing in this example that requires receiving:
+   * everything above it is configuration and transmit.  Every beacon and
+   * probe response in the list came off the antenna, through the PHY, through
+   * the MAC and up into libnet80211, so a non-empty list is the receive path
+   * working end to end.
+   *
+   * Blocking, so the records are ready when the call returns.  The C3 is a
+   * 2.4GHz radio, so a 5GHz-only network cannot appear here however correct
+   * everything else is.
+   */
+  {
+    uint16_t found = 0;
+
+    printf( "scanning...\n" );
+    rv = esp_wifi_scan_start( NULL, true );
+    printf( "esp_wifi_scan_start returned %i\n", (int) rv );
+
+    if ( rv == ESP_OK && esp_wifi_scan_get_ap_num( &found ) == ESP_OK ) {
+      wifi_ap_record_t *records = calloc( found ? found : 1,
+                                          sizeof( *records ) );
+
+      printf( "       %u access point(s) heard\n", (unsigned) found );
+
+      if ( records != NULL && found > 0 ) {
+        uint16_t n = found;
+
+        if ( esp_wifi_scan_get_ap_records( &n, records ) == ESP_OK ) {
+          uint16_t i;
+
+          for ( i = 0; i < n; ++i ) {
+            printf( "       ch %2u  rssi %4i  auth %u  '%s'\n",
+                    (unsigned) records[ i ].primary,
+                    (int) records[ i ].rssi,
+                    (unsigned) records[ i ].authmode,
+                    (const char *) records[ i ].ssid );
+          }
+        }
+      }
+
+      free( records );
+    }
+
+    /*
+     * Not a failure on its own.  In QEMU it is zero unless the MAC model's
+     * simulated access point is enabled, and this example has to pass there
+     * too -- what it would mean on hardware is said above, in the log rather
+     * than in an assertion.
+     */
+    check( "the scan was accepted", rv == ESP_OK );
+  }
+
   printf( "calling esp_wifi_connect to %s...\n", WIFI_NET_SSID );
   rv = esp_wifi_connect();
   printf( "esp_wifi_connect returned %i\n", (int) rv );
