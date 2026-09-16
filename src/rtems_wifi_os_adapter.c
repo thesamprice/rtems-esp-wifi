@@ -699,7 +699,22 @@ static int32_t rtems_wifi_task_get_max_priority( void )
  */
 static void *rtems_wifi_malloc( size_t size )
 {
-  return malloc( size );
+  void *p = malloc( size );
+
+#ifdef RTEMS_WIFI_DEBUG_ALLOC
+  /*
+   * A failed allocation here is silent and costly.  ppInstallKey() asks for
+   * key_len + 168 bytes through _wifi_malloc before it programs a key, and on
+   * NULL it returns 0x101 and installs nothing -- which presents as an
+   * association that completes, a four-way handshake that completes, and no
+   * encrypted frame passing in either direction, with no error anywhere.
+   */
+  if ( p == NULL ) {
+    printk( "wifi.osi: malloc(%u) FAILED\n", (unsigned) size );
+  }
+#endif
+
+  return p;
 }
 
 static void rtems_wifi_free( void *p )

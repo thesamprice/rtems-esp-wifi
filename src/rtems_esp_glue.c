@@ -316,3 +316,54 @@ void esp_log(
 
   printk( "\n" );
 }
+
+/*
+ * memcpy, because newlib's copies small blocks a byte at a time and some of
+ * the destinations here are peripheral registers.
+ *
+ * The WiFi MAC's key table at 0x60034408 is written by the blob through a
+ * plain memcpy of the 16-byte CCMP key.  Newlib's memcpy takes a byte-wise
+ * path for anything up to 32 bytes even when both pointers are word aligned --
+ * it only reaches its word loop above that size -- so those 16 bytes go out as
+ * sixteen sb instructions.  An ESP32 peripheral window answers 32-bit accesses
+ * and discards byte stores, so the key silently never arrives: the BSSID in
+ * the same table entry lands, because the blob writes that with sw
+ * instructions of its own, and the key words stay zero.
+ *
+ * What that looks like from outside is a station that associates, completes
+ * the four-way handshake, reports both keys installed, and then cannot send or
+ * receive a single encrypted frame -- because CCMP is running against an
+ * all-zero key at both ends.  ESP-IDF does not meet this: it links the ROM's
+ * memcpy, which is word-wise.  This port deliberately does not link the ROM
+ * libc -- see the comment in the example's build script about ROM printf
+ * taking the console with it -- so it has to bring its own.
+ *
+ * Aligned copies go out as words.  Anything else falls back to bytes, which is
+ * correct for memory and is the only thing possible for a misaligned buffer;
+ * no caller in this port points memcpy at a peripheral with misaligned
+ * arguments, and the blob's key path is aligned by construction.
+ */
+void *memcpy( void *dst, const void *src, size_t n )
+{
+  unsigned char       *d = dst;
+  const unsigned char *s = src;
+
+  if ( ( ( (uintptr_t) d | (uintptr_t) s ) & 3u ) == 0u ) {
+    uint32_t       *dw = (uint32_t *) (void *) d;
+    const uint32_t *sw = (const uint32_t *) (const void *) s;
+
+    while ( n >= 4u ) {
+      *dw++ = *sw++;
+      n -= 4u;
+    }
+
+    d = (unsigned char *) dw;
+    s = (const unsigned char *) sw;
+  }
+
+  while ( n-- != 0u ) {
+    *d++ = *s++;
+  }
+
+  return dst;
+}
