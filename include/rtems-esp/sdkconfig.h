@@ -100,7 +100,7 @@
  * long and why its absence surfaced as 19 of 48 files failing to compile the
  * moment the supplicant was asked to say anything.
  */
-#define CONFIG_LOG_MAXIMUM_LEVEL 3
+#define CONFIG_LOG_MAXIMUM_LEVEL 5
 
 /*
  * Log API version 2, which is the one whose ESP_LOG_LEVEL reduces to a single

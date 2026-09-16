@@ -479,6 +479,25 @@ static rtems_task Init( rtems_task_argument arg )
     strncpy( (char *) sta.sta.password, WIFI_NET_PASSWORD,
              sizeof( sta.sta.password ) - 1 );
 
+    /*
+     * Pick the strongest access point, not the first acceptable one.
+     *
+     * The default is WIFI_CONNECT_AP_BY_SECURITY, and with several BSSes
+     * sharing one SSID that reliably chose a distant one: a run associated at
+     * -72 dBm while the scan in the same run listed the same SSID at -34.
+     *
+     * That matters more than it looks.  Management frames go out at the lowest
+     * basic rate and survive a weak link; data frames are sent at a rate
+     * chosen for a good one.  A station can therefore associate perfectly and
+     * have every data frame fail, which is indistinguishable from the outside
+     * from an encryption fault -- associated, no deauth, transmit accepted by
+     * the driver, and nothing ever answered.
+     *
+     * So this is here to remove a confound before reading anything into the
+     * data path, not as a tuning preference.
+     */
+    sta.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+
     rv = esp_wifi_set_config( WIFI_IF_STA, &sta );
     check( "esp_wifi_set_config(STA)", rv == ESP_OK );
   }

@@ -278,6 +278,16 @@ static inline void rtems_wifi_reg_write( uint32_t addr, uint32_t value )
  * 64 and esp_wifi_start() returns.
  */
 #define RTEMS_WIFI_CLK_MAC_EN         ( 1u << 6 )
+
+/*
+ * Extra clock bits, for bisecting.  Four bits of SYSTEM_WIFI_CLK_EN_REG are
+ * still clear after everything above -- 11, 12, 16 and 17 -- and none of them
+ * is named by any public header.  Bit 6 turned out to be the MAC's clock and
+ * was found exactly this way, so the knob stays.
+ */
+#ifndef RTEMS_WIFI_CLK_EXTRA
+#define RTEMS_WIFI_CLK_EXTRA 0u
+#endif
 #define RTEMS_WIFI_MODEM_RESET_WHEN_PU                                        \
   ( ( 1u << 0 ) | ( 1u << 1 ) | ( 1u << 2 ) | ( 1u << 3 ) |                    \
     ( 1u << 4 ) | ( 1u << 9 ) | ( 1u << 11 ) | ( 1u << 13 ) )
@@ -547,7 +557,7 @@ static void rtems_esp_wifi_clocks_on( void )
   rtems_wifi_reg_write(
     RTEMS_WIFI_CLK_EN_REG,
     reg | RTEMS_WIFI_CLK_BT_COMMON_M | RTEMS_WIFI_CLK_PHY_EN_M |
-      RTEMS_WIFI_CLK_MAC_EN
+      RTEMS_WIFI_CLK_MAC_EN | RTEMS_WIFI_CLK_EXTRA
   );
 }
 
