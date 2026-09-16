@@ -728,6 +728,58 @@ static rtems_task Init( rtems_task_argument arg )
     printf( "       gateway %s\n",
             ip4addr_ntoa( netif_ip4_gw( &net_interface ) ) );
 
+#ifdef WIFI_NET_MAC_FINGERPRINT
+    /*
+     * A fingerprint of the WiFi MAC window, for comparing against a stock
+     * ESP-IDF image on the same board and access point.
+     *
+     * Per 256-byte block, how many of its 64 words are non-zero.  Small enough
+     * to read in a log and precise enough to show which block holds key
+     * material -- the keys themselves differ between runs, so the comparison
+     * that means anything is populated-versus-empty, not value-versus-value.
+     *
+     * This is the measurement the A/B exists for.  The supplicant says it
+     * installed PTK and GTK and the driver agreed, and no encrypted frame
+     * passes afterwards; a block that stock fills and this does not says the
+     * key never reached the hardware, which is the same shape as the MAC clock
+     * bug where everything reported fine and the block was not there.
+     */
+    printf( "--- MAC window 0x60033000 fingerprint ---\n" );
+
+    {
+      uint32_t base;
+
+      for ( base = 0x60033000u; base < 0x60034000u; base += 0x100u ) {
+        int      nz    = 0;
+        uint32_t first = 0;
+        int      i;
+
+        for ( i = 0; i < 64; ++i ) {
+          uint32_t v = *(volatile uint32_t *) (uintptr_t) ( base + i * 4 );
+
+          if ( v != 0 ) {
+            if ( nz == 0 ) {
+              first = v;
+            }
+
+            ++nz;
+          }
+        }
+
+        if ( nz != 0 ) {
+          printf( "0x%08x: %2d/64 nonzero, first 0x%08x\n",
+                  (unsigned) base, nz, (unsigned) first );
+        } else {
+          printf( "0x%08x:  0/64\n", (unsigned) base );
+        }
+      }
+
+      printf( "clk_en 0x%08x rst_en 0x%08x\n",
+              (unsigned) *(volatile uint32_t *) (uintptr_t) 0x60026014u,
+              (unsigned) *(volatile uint32_t *) (uintptr_t) 0x60026018u );
+    }
+#endif
+
 #ifdef WIFI_NET_UDP_PROBE
     /*
      * Shout onto the LAN, so another host can say whether we are audible.

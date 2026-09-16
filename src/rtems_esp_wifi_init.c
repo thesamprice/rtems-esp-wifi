@@ -288,6 +288,12 @@ static inline void rtems_wifi_reg_write( uint32_t addr, uint32_t value )
 #ifndef RTEMS_WIFI_CLK_EXTRA
 #define RTEMS_WIFI_CLK_EXTRA 0u
 #endif
+
+#ifdef RTEMS_WIFI_CLK_ABSOLUTE
+#ifndef RTEMS_WIFI_RST_ABSOLUTE
+#define RTEMS_WIFI_RST_ABSOLUTE 0u
+#endif
+#endif
 #define RTEMS_WIFI_MODEM_RESET_WHEN_PU                                        \
   ( ( 1u << 0 ) | ( 1u << 1 ) | ( 1u << 2 ) | ( 1u << 3 ) |                    \
     ( 1u << 4 ) | ( 1u << 9 ) | ( 1u << 11 ) | ( 1u << 13 ) )
@@ -750,6 +756,30 @@ esp_err_t esp_wifi_init( const wifi_init_config_t *config )
 
     return result;
   }
+
+#ifdef RTEMS_WIFI_CLK_ABSOLUTE
+  /*
+   * Put the clock and reset registers where a stock ESP-IDF image has them,
+   * once everything is initialised.
+   *
+   * After the PHY and the libraries, not before.  Applying these at
+   * clocks_on() hangs register_chipv7_phy(): the stock values were read after
+   * association, by which time stock has turned back off things the PHY needed
+   * while calibrating.  Clock setup is a sequence, and a register read at the
+   * end of it is not a description of the beginning.
+   *
+   * The values themselves come from an A/B on this board: stock reads
+   * SYSTEM_WIFI_CLK_EN_REG 0xff87f850 and SYSTEM_WIFI_RST_EN_REG 0x00003e08
+   * where this port has 0xfffce7ff and 0.  Stock sets bits 11, 12, 16 and 17
+   * that no public header names, clears most of WIFI_BT_COMMON, and holds the
+   * Bluetooth blocks in reset rather than releasing them.
+   */
+  rtems_wifi_reg_write( RTEMS_WIFI_CLK_EN_REG, RTEMS_WIFI_CLK_ABSOLUTE );
+  rtems_wifi_reg_write( RTEMS_WIFI_RST_EN_REG, RTEMS_WIFI_RST_ABSOLUTE );
+  printk( "rtems-esp-wifi: clocks set to stock values %08x / %08x\n",
+          rtems_wifi_reg_read( RTEMS_WIFI_CLK_EN_REG ),
+          rtems_wifi_reg_read( RTEMS_WIFI_RST_EN_REG ) );
+#endif
 
   printk( "rtems-esp-wifi: libraries initialised, esp_supplicant_init()...\n" );
 
