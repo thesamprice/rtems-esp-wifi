@@ -116,7 +116,7 @@ ESP32-C3 reaches its SRAM for instruction fetch through a window near
 `0x4037c000` that neither the BSP nor the QEMU model defines.
 
 That was the same blocker as rtems-esphome#42, and it is now cleared:
-`patches/rtems/0009-esp32c3-iram-region.patch` in rtems-esphome adds a
+rtems-esphome's `src/rtems` branch `esp32c3-rtems-esphome` adds a
 `RAM_CODE` region at `0x40380000` sized by `ESP32C_IRAM_REGION_SIZE`, and
 `tests/bsp-iram` shows a function linking there and running.
 
