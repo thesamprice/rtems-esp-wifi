@@ -624,6 +624,23 @@ static int32_t rtems_wifi_task_create(
          RTEMS_FLOATING_POINT | RTEMS_LOCAL,
          &id
        ) != RTEMS_SUCCESSFUL ) {
+    /*
+     * Loud, because the alternative is a WiFi stack that waits for a task
+     * that does not exist.
+     *
+     * This returned 0 silently, and FreeRTOS' pdFALSE is what the libraries
+     * see -- they do not report it either.  What it looks like from outside is
+     * an association that completes and a stack that then stops responding,
+     * with no error anywhere and the clock still ticking.  The usual cause is
+     * CONFIGURE_MAXIMUM_TASKS being too small for the WiFi tasks plus the
+     * timer server, lwIP's tcpip thread and whatever the application runs.
+     */
+    printk(
+      "wifi.osi: cannot create task '%s' (prio %d, stack %u) -- "
+      "CONFIGURE_MAXIMUM_TASKS or workspace too small\n",
+      name != NULL ? name : "?", (int) rtems_prio, (unsigned) stack_depth
+    );
+
     return 0;
   }
 
