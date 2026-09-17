@@ -56,10 +56,12 @@
 #include <netstart.h>
 
 #include <lwip/dhcp.h>
+#include <lwip/memp.h>
 #include <lwip/netif.h>
 #include <lwip/netifapi.h>
 #include <lwip/pbuf.h>
 #include <lwip/sockets.h>
+#include <lwip/stats.h>
 
 #include <rtems.h>
 
@@ -76,6 +78,37 @@ static void check( const char *what, bool ok )
   if ( !ok ) {
     ++failures;
   }
+}
+
+/*
+ * The two lwIP statics rtems-esphome#121 shrank, reported as what they were
+ * actually asked for rather than as what they were sized to.
+ *
+ * `max` is the high-water mark since boot and `err` the number of times an
+ * allocation was refused, both maintained by lwIP itself -- MEM_STATS and
+ * MEMP_STATS default to on and nothing here turns them off.  They are the
+ * only numbers that can say a pool is big enough, because being too small is
+ * not an error anywhere else: a refused pbuf is a dropped frame, and a dropped
+ * frame on a radio is indistinguishable from one that was never sent.
+ *
+ * Printed rather than asserted.  What counts as enough headroom depends on the
+ * load the run was given, which this file does not know; the assertion that
+ * can be made without knowing it -- that nothing was refused -- is made below.
+ */
+static void report_lwip_memory( void )
+{
+#if MEMP_STATS
+  const struct stats_mem *pool = lwip_stats.memp[ MEMP_PBUF_POOL ];
+
+  printf( "pbuf pool   %u of %u used, max %u, refused %u\n",
+          (unsigned) pool->used, (unsigned) pool->avail,
+          (unsigned) pool->max, (unsigned) pool->err );
+#endif
+#if MEM_STATS
+  printf( "lwip heap   %u of %u used, max %u, refused %u\n",
+          (unsigned) lwip_stats.mem.used, (unsigned) lwip_stats.mem.avail,
+          (unsigned) lwip_stats.mem.max, (unsigned) lwip_stats.mem.err );
+#endif
 }
 
 /*
@@ -103,6 +136,43 @@ static void check( const char *what, bool ok )
 #define STA_IP_B 0
 #define STA_IP_C 2
 #define STA_IP_D 15
+
+/*
+ * How long to sit on the network after DHCP has bound, so that something else
+ * can put load on the receive path.
+ *
+ * This exists because rtems-esphome#121 shrank PBUF_POOL_SIZE, and a pbuf pool
+ * that is too small does not report an error: it drops frames, and the radio
+ * appears to go quiet.  Nothing above can detect that, because nothing above
+ * generates enough traffic to approach the pool at any depth -- a DHCP
+ * exchange and twenty broadcasts never allocate more than two pool entries at
+ * once.  So the station stays up and idle while a host floods it, and the lwIP
+ * pool statistics printed at the end say how close it came.
+ *
+ * Zero, the default, skips it: the QEMU runs have no one to flood them.
+ */
+#ifndef WIFI_NET_RX_SOAK_SECONDS
+#define WIFI_NET_RX_SOAK_SECONDS 0
+#endif
+
+/*
+ * How many pool entries to take away before the soak, and never give back.
+ *
+ * The negative control for the check above.  A test that has only ever been
+ * seen to pass has not been shown capable of failing, and the whole point of
+ * the pool statistics is to catch a shortage that is otherwise invisible -- so
+ * there has to be a run in which they do catch one.  Holding all but a couple
+ * of the entries makes the pool demonstrably too small for the same flood, on
+ * the same image, with one -D changed.
+ *
+ * It deliberately starves rather than rebuilding lwIP with a smaller
+ * PBUF_POOL_SIZE.  Both would work; this one keeps the binary under test the
+ * binary that ships, so a difference in the numbers is the pool depth and not
+ * anything else that a second build might have changed.
+ */
+#ifndef WIFI_NET_PBUF_STARVE
+#define WIFI_NET_PBUF_STARVE 0
+#endif
 
 static struct netif net_interface;
 
@@ -883,6 +953,48 @@ static rtems_task Init( rtems_task_argument arg )
     printf( "       gateway %s\n",
             ip4addr_ntoa( netif_ip4_gw( &net_interface ) ) );
 
+#if WIFI_NET_PBUF_STARVE > 0 || WIFI_NET_RX_SOAK_SECONDS > 0
+    /*
+     * Load the receive path, with the pool optionally crippled first.
+     *
+     * The starve loop runs before the soak so that the flood meets the smaller
+     * pool rather than a full one.  The pbufs are held for the rest of the run
+     * on purpose -- freeing them would let the pool recover and the numbers at
+     * the end would describe a pool that was briefly small, which is not the
+     * failure being reproduced.
+     *
+     * pbuf_alloc() is asked for one full frame each time, which is one pool
+     * entry, so the count here is the count of entries taken.  A refusal ends
+     * the loop and is reported: it means the pool was already smaller than the
+     * request, which is worth seeing rather than looping on.
+     */
+    {
+      int soak = WIFI_NET_RX_SOAK_SECONDS;
+#if WIFI_NET_PBUF_STARVE > 0
+      int i;
+
+      printf( "holding %d pbuf pool entries...\n", WIFI_NET_PBUF_STARVE );
+
+      for ( i = 0; i < WIFI_NET_PBUF_STARVE; ++i ) {
+        if ( pbuf_alloc( PBUF_RAW, 1500, PBUF_POOL ) == NULL ) {
+          printf( "       pool refused entry %d of %d\n",
+                  i, WIFI_NET_PBUF_STARVE );
+          break;
+        }
+      }
+
+      printf( "       held %d\n", i );
+#endif
+
+      if ( soak > 0 ) {
+        printf( "soaking the receive path for %ds; flood this station now\n",
+                soak );
+        rtems_task_wake_after( (rtems_interval) soak *
+                               rtems_clock_get_ticks_per_second() );
+      }
+    }
+#endif
+
 #ifdef WIFI_NET_MAC_WORDS
     /*
      * The one block the fingerprint found a structural difference in.
@@ -1106,6 +1218,9 @@ done:
   printf( "\nnetif counters:\n" );
   rtems_esp_netif_print_stats();
 
+  printf( "\nlwip memory:\n" );
+  report_lwip_memory();
+
   /*
    * Said in words as well as in the zero above, because a reader who sees
    * eb_taken == eb_released might otherwise take it for a result.  It holds
@@ -1161,6 +1276,31 @@ done:
    */
   check( "every eb handle the driver lent us was given back",
          stats->eb_taken == stats->eb_released );
+
+  /*
+   * The pool was big enough for whatever this run was given.
+   *
+   * Like the eb check above it holds vacuously on an idle run -- a station
+   * that receives nothing cannot exhaust anything -- which is why it is worth
+   * stating what makes it non-vacuous: WIFI_NET_RX_SOAK_SECONDS with a host
+   * flooding the station, and WIFI_NET_PBUF_STARVE to show that the same two
+   * counters do move when the pool really is too small.
+   *
+   * Both halves matter.  rx_dropped_no_pbuf is this driver refusing a frame it
+   * had already taken off the radio; memp `err` is lwIP refusing anything from
+   * the pool, including allocations the stack makes for itself, so neither one
+   * contains the other.
+   */
+  check( "no frame was dropped for want of a pbuf",
+         stats->rx_dropped_no_pbuf == 0 );
+#if MEMP_STATS
+  check( "the pbuf pool never refused an allocation",
+         lwip_stats.memp[ MEMP_PBUF_POOL ]->err == 0 );
+#endif
+#if MEM_STATS
+  check( "the lwIP heap never refused an allocation",
+         lwip_stats.mem.err == 0 );
+#endif
 
   printf( "\n%d failure(s)\n", failures );
 

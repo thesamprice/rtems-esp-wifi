@@ -17,6 +17,12 @@ LIB=$SP/wifi-prefix/riscv-rtems7/esp32c3db/lib
 HAL=$SP/hal/components
 LD=$HAL/esp_rom/esp32c3/ld
 QEMU=${QEMU:-/Users/sprice5/src/rtems-esphome/src/esp-qemu/build/qemu-system-riscv32}
+# Extra -D for init.c, deliberately unquoted below so that several can be given
+# in one string.  This is how the example's compile-time knobs are set --
+# -DWIFI_NET_SSID=\"...\" and -DWIFI_NET_PASSWORD=\"...\" for a real network,
+# and -DWIFI_NET_RX_SOAK_SECONDS / -DWIFI_NET_PBUF_STARVE for the pbuf pool
+# check and its negative control.
+EXTRA=${EXTRA-}
 export PATH=$HOME/rtems/7/bin:$PATH
 OUT=$SP/wifi-net-out; mkdir -p "$OUT/ldir"
 
@@ -86,7 +92,7 @@ grep -q 'unexpected_sections' "$OUT/ldir/linkcmds" || {
 # source checkout's.
 riscv-rtems7-gcc -march=rv32imc -mabi=ilp32 -isystem "$LIB/include" \
   -I $GLUE/include -I $GLUE/include/rtems-esp \
-  -I $HAL/esp_wifi/include -I $HAL/esp_common/include -I $HAL/esp_event/include \
+  -I $HAL/esp_wifi/include -I $HAL/esp_wifi/include/local -I $HAL/esp_common/include -I $HAL/esp_event/include \
   -I $HAL/log/include -I $HAL/esp_rom/include -I $HAL/soc/include \
   -I $HAL/soc/esp32c3/include -I $HAL/esp_hw_support/include \
   -I $HAL/esp_timer/include -I $HAL/esp_phy/include \
@@ -95,11 +101,12 @@ riscv-rtems7-gcc -march=rv32imc -mabi=ilp32 -isystem "$LIB/include" \
 
 riscv-rtems7-gcc -march=rv32imc -mabi=ilp32 -isystem "$LIB/include" -B "$OUT/ldir" -B "$LIB" -qrtems \
   -I $GLUE/include -I $GLUE/include/rtems-esp \
-  -I $HAL/esp_wifi/include -I $HAL/esp_common/include -I $HAL/esp_event/include \
+  -I $HAL/esp_wifi/include -I $HAL/esp_wifi/include/local -I $HAL/esp_common/include -I $HAL/esp_event/include \
   -I $HAL/log/include -I $HAL/esp_rom/include -I $HAL/soc/include \
   -I $HAL/soc/esp32c3/include -I $HAL/esp_hw_support/include \
   -I $HAL/esp_timer/include -I $HAL/esp_phy/include \
   -o "$OUT/wifi-net.exe" \
+  $EXTRA \
   "$GLUE/examples/wifi-net/init.c" \
   `# The netif goes on the link line as an object, not into an archive.` \
   `#` \
