@@ -182,6 +182,19 @@ struct netif *rtems_esp_netif_get( void );
  */
 int rtems_esp_netif_start( void );
 
+/**
+ * @brief Installs the receive path again, after the station has associated.
+ *
+ * esp_wifi_internal_reg_rxcb() does not keep a registration made before the
+ * association, and reports no error about it.  The port installs the receive
+ * path on WIFI_EVENT_STA_START, which is the right place for everything else
+ * and is too early for this; an application that associates has to ask for it
+ * again once it has, or no frame ever reaches the interface.
+ *
+ * @retval 0 The receive path is installed.
+ */
+int rtems_esp_netif_reattach( void );
+
 /* The inverse.  Removes the receive path and takes the interface down. */
 int rtems_esp_netif_stop( void );
 

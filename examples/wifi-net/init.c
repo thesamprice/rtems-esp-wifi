@@ -44,13 +44,24 @@
  * libraries what they think of a transmit rather than only counting that they
  * refused one. */
 #include <esp_private/wifi.h>
+/*
+ * wifi_promiscuous_pkt_t lives here rather than in esp_wifi_types.h.  It is
+ * the per-chip half of the types header, and it has to be: wifi_pkt_rx_ctrl_t
+ * is 48 bytes on the C3 against 28 on the original ESP32, so a payload offset
+ * taken from the wrong one lands in the middle of the metadata.
+ */
+#include <esp_wifi_types_native.h>
 
 /* start_networking(), from the BSP's installed rtems-lwip headers. */
 #include <netstart.h>
 
+#include <lwip/dhcp.h>
+#include <lwip/memp.h>
 #include <lwip/netif.h>
+#include <lwip/netifapi.h>
 #include <lwip/pbuf.h>
 #include <lwip/sockets.h>
+#include <lwip/stats.h>
 
 #include <rtems.h>
 
@@ -70,17 +81,182 @@ static void check( const char *what, bool ok )
 }
 
 /*
+ * The two lwIP statics rtems-esphome#121 shrank, reported as what they were
+ * actually asked for rather than as what they were sized to.
+ *
+ * `max` is the high-water mark since boot and `err` the number of times an
+ * allocation was refused, both maintained by lwIP itself -- MEM_STATS and
+ * MEMP_STATS default to on and nothing here turns them off.  They are the
+ * only numbers that can say a pool is big enough, because being too small is
+ * not an error anywhere else: a refused pbuf is a dropped frame, and a dropped
+ * frame on a radio is indistinguishable from one that was never sent.
+ *
+ * Printed rather than asserted.  What counts as enough headroom depends on the
+ * load the run was given, which this file does not know; the assertion that
+ * can be made without knowing it -- that nothing was refused -- is made below.
+ */
+static void report_lwip_memory( void )
+{
+#if MEMP_STATS
+  const struct stats_mem *pool = lwip_stats.memp[ MEMP_PBUF_POOL ];
+
+  printf( "pbuf pool   %u of %u used, max %u, refused %u\n",
+          (unsigned) pool->used, (unsigned) pool->avail,
+          (unsigned) pool->max, (unsigned) pool->err );
+#endif
+#if MEM_STATS
+  printf( "lwip heap   %u of %u used, max %u, refused %u\n",
+          (unsigned) lwip_stats.mem.used, (unsigned) lwip_stats.mem.avail,
+          (unsigned) lwip_stats.mem.max, (unsigned) lwip_stats.mem.err );
+#endif
+}
+
+/*
  * QEMU's user-mode NAT addresses, which is the convention tests/zynq-lwip
  * follows.  Nothing routes here -- there is no NIC behind this netif -- but a
  * static address means no check below depends on a DHCP server answering, and
  * it keeps the two lwIP examples in this tree describing the same network.
  */
+/*
+ * How long to wait for a DHCP lease once associated.  Generous: a sleeping
+ * access point can take several seconds to answer a discover, and the cost of
+ * being wrong here is a spurious failure on a working network.
+ */
+#define DHCP_WAIT_SECONDS 20
+
+/* Where WIFI_NET_UDP_PROBE shouts, and how many times. */
+#ifndef WIFI_NET_UDP_PROBE_PORT
+#define WIFI_NET_UDP_PROBE_PORT 47777
+#endif
+#ifndef WIFI_NET_UDP_PROBE_COUNT
+#define WIFI_NET_UDP_PROBE_COUNT 20
+#endif
+
 #define STA_IP_A 10
 #define STA_IP_B 0
 #define STA_IP_C 2
 #define STA_IP_D 15
 
+/*
+ * How long to sit on the network after DHCP has bound, so that something else
+ * can put load on the receive path.
+ *
+ * This exists because rtems-esphome#121 shrank PBUF_POOL_SIZE, and a pbuf pool
+ * that is too small does not report an error: it drops frames, and the radio
+ * appears to go quiet.  Nothing above can detect that, because nothing above
+ * generates enough traffic to approach the pool at any depth -- a DHCP
+ * exchange and twenty broadcasts never allocate more than two pool entries at
+ * once.  So the station stays up and idle while a host floods it, and the lwIP
+ * pool statistics printed at the end say how close it came.
+ *
+ * Zero, the default, skips it: the QEMU runs have no one to flood them.
+ */
+#ifndef WIFI_NET_RX_SOAK_SECONDS
+#define WIFI_NET_RX_SOAK_SECONDS 0
+#endif
+
+/*
+ * How many pool entries to take away before the soak, and never give back.
+ *
+ * The negative control for the check above.  A test that has only ever been
+ * seen to pass has not been shown capable of failing, and the whole point of
+ * the pool statistics is to catch a shortage that is otherwise invisible -- so
+ * there has to be a run in which they do catch one.  Holding all but a couple
+ * of the entries makes the pool demonstrably too small for the same flood, on
+ * the same image, with one -D changed.
+ *
+ * It deliberately starves rather than rebuilding lwIP with a smaller
+ * PBUF_POOL_SIZE.  Both would work; this one keeps the binary under test the
+ * binary that ships, so a difference in the numbers is the pool depth and not
+ * anything else that a second build might have changed.
+ */
+#ifndef WIFI_NET_PBUF_STARVE
+#define WIFI_NET_PBUF_STARVE 0
+#endif
+
 static struct netif net_interface;
+
+#ifdef WIFI_NET_PROMISC_PROBE
+static volatile unsigned promisc_frames;
+static volatile unsigned promisc_data;
+
+/*
+ * Counts everything the radio hears while associated.
+ *
+ * It answers one question that the netif counters cannot: rx_frames 0 with
+ * every rx_dropped_* also 0 means our callback was never called, and that is
+ * equally what "the radio hears nothing" and "the radio hears plenty and the
+ * libraries keep all of it" look like.  Promiscuous mode sits below the
+ * filtering and the decryption, so a non-zero count here puts the fault above
+ * the MAC and a zero one puts it below.
+ *
+ * The data subtype is counted separately because that is the interesting one.
+ * Beacons prove the receive chain works at all -- the scan already did -- but
+ * only data frames can become a DHCP offer.
+ */
+static volatile unsigned promisc_to_us;
+static volatile unsigned promisc_data_to_us;
+static volatile unsigned promisc_data_bcast;
+static volatile unsigned promisc_data_prot;
+
+/*
+ * addr1 of an 802.11 header is the receiver address, and it is the only field
+ * that answers the question that matters here: is the access point sending
+ * anything to this station at all?
+ *
+ * "No frames reach the netif" has two causes that look identical from the
+ * netif side and want opposite fixes.  Either the access point is not
+ * transmitting to us -- our own transmits are being accepted by the driver and
+ * going nowhere, so nothing is ever answered -- or it is transmitting and the
+ * libraries are keeping every frame, which would point at decryption.
+ * Counting by receiver address separates them.
+ *
+ * The header starts at payload: frame control (2), duration (2), then addr1.
+ */
+static void promisc_cb( void *buf, wifi_promiscuous_pkt_type_t type )
+{
+  const wifi_promiscuous_pkt_t *pkt = buf;
+  bool                          to_us;
+
+  ++promisc_frames;
+
+  if ( pkt == NULL ) {
+    return;
+  }
+
+  to_us = memcmp( pkt->payload + 4, net_interface.hwaddr, 6 ) == 0;
+
+  if ( to_us ) {
+    ++promisc_to_us;
+  }
+
+  if ( type == WIFI_PKT_DATA ) {
+    ++promisc_data;
+
+    if ( to_us ) {
+      ++promisc_data_to_us;
+    }
+
+    /*
+     * Broadcast counts separately because a DHCP offer usually is one, and
+     * because broadcast data is encrypted with the group key rather than the
+     * pairwise key -- so "plenty of broadcast data on the air, none of it
+     * reaching the interface" and "nothing addressed to us at all" point at
+     * different halves of the problem.
+     */
+    if ( pkt->payload[ 4 ] == 0xff && pkt->payload[ 5 ] == 0xff &&
+         pkt->payload[ 6 ] == 0xff && pkt->payload[ 7 ] == 0xff &&
+         pkt->payload[ 8 ] == 0xff && pkt->payload[ 9 ] == 0xff ) {
+      ++promisc_data_bcast;
+    }
+
+    /* Frame control bit 14 is Protected: the frame body is encrypted. */
+    if ( ( pkt->payload[ 1 ] & 0x40u ) != 0u ) {
+      ++promisc_data_prot;
+    }
+  }
+}
+#endif
 
 /*
  * start_networking() takes one and the ESP32-C3 ignores it: a station's MAC
@@ -141,7 +317,6 @@ static void on_wifi_event(
 )
 {
   (void) arg;
-  (void) data;
 
   printf( "       event: %s id %i\n", base, (int) id );
 
@@ -157,10 +332,60 @@ static void on_wifi_event(
   switch ( id ) {
     case WIFI_EVENT_STA_START:        ++sta_start_seen;        break;
     case WIFI_EVENT_STA_CONNECTED:    ++sta_connected_seen;    break;
-    case WIFI_EVENT_STA_DISCONNECTED: ++sta_disconnected_seen; break;
+    case WIFI_EVENT_STA_DISCONNECTED:
+      ++sta_disconnected_seen;
+
+      /*
+       * The reason, not just the count.  "Disconnected" on its own does not
+       * say whether the access point was never seen, refused the credentials,
+       * or dropped the association later, and those want three different
+       * things done about them.  The common ones on a first attempt are
+       * WIFI_REASON_NO_AP_FOUND (201), which on this chip usually means the
+       * network is 5GHz and the C3 is 2.4GHz only, and
+       * WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT (15), which means the passphrase
+       * was wrong.
+       */
+      if ( data != NULL ) {
+        const wifi_event_sta_disconnected_t *d = data;
+
+        printf( "       disconnected: reason %i, rssi %i, ssid '%.*s'\n",
+                (int) d->reason, (int) d->rssi,
+                (int) d->ssid_len, (const char *) d->ssid );
+      }
+
+      break;
     default: break;
   }
 }
+
+#ifdef WIFI_NET_KEY_DELTA
+/*
+ * The MAC's key-slot region, printed with a tag so two dumps can be diffed.
+ *
+ * Taken before esp_wifi_connect() and again after the four-way handshake has
+ * reported both keys installed.  If the words that should hold key material
+ * are the same in both, the install never reached the hardware -- and that
+ * needs no comparison against another image to interpret, which is what makes
+ * it worth doing after so much A/B.
+ */
+static void dump_key_region( const char *tag )
+{
+  uint32_t base;
+
+  for ( base = 0x60034000u; base < 0x60036000u; base += 32u ) {
+    int i;
+
+    printf( "KEY %s %08x:", tag, (unsigned) base );
+
+    for ( i = 0; i < 8; ++i ) {
+      printf( " %08x",
+              (unsigned) *(volatile uint32_t *) (uintptr_t) ( base + i * 4 ) );
+    }
+
+    printf( "\n" );
+  }
+}
+#endif
 
 static void print_mac( const char *what, const uint8_t mac[ 6 ] )
 {
@@ -255,10 +480,20 @@ static rtems_task Init( rtems_task_argument arg )
   uint8_t                      wifi_mac[ 6 ];
   const rtems_esp_netif_stats *stats;
   uint32_t                     tx_before;
-  err_t                        err_single, err_chained;
+  err_t                        err_single, err_chained, err;
   int                          sock;
 
   (void) arg;
+
+  /*
+   * Fetched here rather than beside its first use further down.  It is a
+   * pointer to a static counter block in the port, so it is valid before
+   * anything is initialised -- and the "goto done" on an esp_wifi_init()
+   * failure jumps straight past the assignment that used to be the only one,
+   * into a block that dereferences it.  That path has never been taken, which
+   * is the only reason it has not crashed.
+   */
+  stats = rtems_esp_netif_get_stats();
 
   printf( "\n*** ESP32-C3 WIFI + LWIP TEST ***\n" );
 
@@ -363,6 +598,25 @@ static rtems_task Init( rtems_task_argument arg )
     strncpy( (char *) sta.sta.password, WIFI_NET_PASSWORD,
              sizeof( sta.sta.password ) - 1 );
 
+    /*
+     * Pick the strongest access point, not the first acceptable one.
+     *
+     * The default is WIFI_CONNECT_AP_BY_SECURITY, and with several BSSes
+     * sharing one SSID that reliably chose a distant one: a run associated at
+     * -72 dBm while the scan in the same run listed the same SSID at -34.
+     *
+     * That matters more than it looks.  Management frames go out at the lowest
+     * basic rate and survive a weak link; data frames are sent at a rate
+     * chosen for a good one.  A station can therefore associate perfectly and
+     * have every data frame fail, which is indistinguishable from the outside
+     * from an encryption fault -- associated, no deauth, transmit accepted by
+     * the driver, and nothing ever answered.
+     *
+     * So this is here to remove a confound before reading anything into the
+     * data path, not as a tuning preference.
+     */
+    sta.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+
     rv = esp_wifi_set_config( WIFI_IF_STA, &sta );
     check( "esp_wifi_set_config(STA)", rv == ESP_OK );
   }
@@ -406,6 +660,88 @@ static rtems_task Init( rtems_task_argument arg )
    * correctly, because without a connection attempt there is no BSS a data
    * frame could belong to.
    */
+  /*
+   * Scan before connecting, and print what is out there.
+   *
+   * A disconnect with WIFI_REASON_NO_AP_FOUND has two very different causes
+   * and the reason code cannot tell them apart: either the receive path does
+   * not work and the station hears nothing at all, or it works and the
+   * network asked for is genuinely not on the air.  A list of everything
+   * heard separates them in one run.
+   *
+   * It is also the first thing in this example that requires receiving:
+   * everything above it is configuration and transmit.  Every beacon and
+   * probe response in the list came off the antenna, through the PHY, through
+   * the MAC and up into libnet80211, so a non-empty list is the receive path
+   * working end to end.
+   *
+   * Blocking, so the records are ready when the call returns.  The C3 is a
+   * 2.4GHz radio, so a 5GHz-only network cannot appear here however correct
+   * everything else is.
+   */
+  {
+    uint16_t found = 0;
+
+    printf( "scanning...\n" );
+    rv = esp_wifi_scan_start( NULL, true );
+    printf( "esp_wifi_scan_start returned %i\n", (int) rv );
+
+    if ( rv == ESP_OK && esp_wifi_scan_get_ap_num( &found ) == ESP_OK ) {
+      wifi_ap_record_t *records = calloc( found ? found : 1,
+                                          sizeof( *records ) );
+
+      printf( "       %u access point(s) heard\n", (unsigned) found );
+
+      if ( records != NULL && found > 0 ) {
+        uint16_t n = found;
+
+        if ( esp_wifi_scan_get_ap_records( &n, records ) == ESP_OK ) {
+          uint16_t i;
+
+          for ( i = 0; i < n; ++i ) {
+            printf( "       ch %2u  rssi %4i  auth %u  '%s'\n",
+                    (unsigned) records[ i ].primary,
+                    (int) records[ i ].rssi,
+                    (unsigned) records[ i ].authmode,
+                    (const char *) records[ i ].ssid );
+          }
+        }
+      }
+
+      free( records );
+    }
+
+    /*
+     * Not a failure on its own.  In QEMU it is zero unless the MAC model's
+     * simulated access point is enabled, and this example has to pass there
+     * too -- what it would mean on hardware is said above, in the log rather
+     * than in an assertion.
+     */
+    check( "the scan was accepted", rv == ESP_OK );
+  }
+
+  /*
+   * Power save off, before associating.
+   *
+   * ESP-IDF defaults a station to WIFI_PS_MIN_MODEM: the radio sleeps between
+   * DTIMs and wakes in time for the next beacon.  That needs the sleep side of
+   * the OS adapter to work, and on this port it does not -- see the named
+   * failures in rtems_wifi_os_adapter.c.  What that looks like from outside is
+   * an association that succeeds and then goes deaf:
+   * WIFI_EVENT_STA_BEACON_TIMEOUT arrives a few seconds later, DHCP discovers
+   * go out and nothing ever comes back, and the counters show transmit working
+   * and rx_frames stuck at 0.
+   *
+   * Has to be after esp_wifi_start(); ESP-IDF rejects it before.
+   */
+  rv = esp_wifi_set_ps( WIFI_PS_NONE );
+  printf( "esp_wifi_set_ps(WIFI_PS_NONE) returned %i\n", (int) rv );
+  check( "power save could be turned off", rv == ESP_OK );
+
+#ifdef WIFI_NET_KEY_DELTA
+  dump_key_region( "before" );
+#endif
+
   printf( "calling esp_wifi_connect to %s...\n", WIFI_NET_SSID );
   rv = esp_wifi_connect();
   printf( "esp_wifi_connect returned %i\n", (int) rv );
@@ -426,11 +762,409 @@ static rtems_task Init( rtems_task_argument arg )
          sta_connected_seen > 0 || sta_disconnected_seen > 0 );
 
   /*
+   * What was actually negotiated, when there is an association to ask about.
+   *
+   * esp_wifi_sta_get_ap_info() reports the ciphers the station and the access
+   * point agreed on, which is worth having in the log next to a run where
+   * transmit is accepted by the driver and nothing arrives: a pairwise cipher
+   * of WIFI_CIPHER_TYPE_CCMP means the RSN negotiation completed and the data
+   * path is expected to be encrypted, and it narrows the remaining question to
+   * whether the key reached the hardware.
+   */
+  if ( sta_connected_seen > 0 ) {
+    wifi_ap_record_t ap;
+
+    if ( esp_wifi_sta_get_ap_info( &ap ) == ESP_OK ) {
+      printf( "       associated to '%s' ch %u rssi %i\n",
+              (const char *) ap.ssid, (unsigned) ap.primary, (int) ap.rssi );
+      printf( "       authmode %u  pairwise cipher %u  group cipher %u\n",
+              (unsigned) ap.authmode,
+              (unsigned) ap.pairwise_cipher,
+              (unsigned) ap.group_cipher );
+    } else {
+      printf( "       esp_wifi_sta_get_ap_info failed\n" );
+    }
+  }
+
+#ifdef WIFI_NET_MAC_BITFIX
+    /*
+     * Clear the two MAC bits this port sets and a working image does not.
+     *
+     * From the word-level A/B in #115: 0x60033c34 reads 0x19a8f9e0 here and
+     * 0x19a879e0 on stock, and 0x60033c38 reads 0x0400041f here and 0x0000041f
+     * there -- bit 15 and bit 26 respectively, by XOR rather than by eye.  Everything around them matches
+     * word for word, so these are not live state.
+     *
+     * A bit that this port sets and a working image leaves clear is more
+     * likely to be our mistake than the reverse, which is the whole reason to
+     * try clearing rather than setting.  Blind, in the sense that no
+     * documentation names either bit -- but bit 6 of the clock register was
+     * equally undocumented and was the MAC's clock.
+     */
+    {
+      uint32_t a = *(volatile uint32_t *) (uintptr_t) 0x60033c34u;
+      uint32_t b = *(volatile uint32_t *) (uintptr_t) 0x60033c38u;
+
+      *(volatile uint32_t *) (uintptr_t) 0x60033c34u = a & ~( 1u << 15 );
+      *(volatile uint32_t *) (uintptr_t) 0x60033c38u = b & ~( 1u << 26 );
+
+      printf( "mac bitfix: 0x60033c34 %08x -> %08x, 0x60033c38 %08x -> %08x\n",
+              (unsigned) a,
+              (unsigned) *(volatile uint32_t *) (uintptr_t) 0x60033c34u,
+              (unsigned) b,
+              (unsigned) *(volatile uint32_t *) (uintptr_t) 0x60033c38u );
+    }
+#endif
+
+#ifdef WIFI_NET_FIX_RATE
+  /*
+   * Pin the data rate to 1 Mbps, long preamble.
+   *
+   * An access point acknowledges a correctly received unicast frame at layer
+   * 2 whether or not it later discards it -- a decryption failure still gets
+   * an ACK.  So the transmit retry counters in the MAC, which an A/B against a
+   * stock image showed running twenty to thirty times higher here than there,
+   * do not say "the access point rejected this": they say it never decoded it.
+   *
+   * Management frames go out at the lowest basic rate and are what association
+   * is made of, and association works.  Data frames go out at whatever rate
+   * control picks.  That is the one part of the path that differs between the
+   * frames that work and the frames that do not, and it is testable in one
+   * line.
+   *
+   * If DHCP binds with this on, the fault is rate control and not encryption,
+   * and everything upstream of here -- the handshake, the keys, the cipher
+   * negotiation -- was a red herring.
+   */
+  rv = esp_wifi_internal_set_fix_rate( WIFI_IF_STA, true, WIFI_PHY_RATE_1M_L );
+  printf( "esp_wifi_internal_set_fix_rate(1M) returned %i\n", (int) rv );
+#endif
+
+#ifdef WIFI_NET_PROMISC_PROBE
+  /*
+   * Listen on the air straight after associating, before DHCP.
+   *
+   * The first run of this was taken after the DHCP wait had already expired,
+   * by which time lwIP had backed off and an idle station legitimately hears
+   * nothing addressed to it -- so "zero frames to this station" was measured at
+   * the wrong moment and did not support the conclusion drawn from it.  Here it
+   * runs while there is traffic to hear.
+   */
+  if ( sta_connected_seen > 0 ) {
+    printf( "listening on the air for 8s...\n" );
+
+    if ( esp_wifi_set_promiscuous_rx_cb( promisc_cb ) == ESP_OK &&
+         esp_wifi_set_promiscuous( true ) == ESP_OK ) {
+      rtems_task_wake_after( 8 * rtems_clock_get_ticks_per_second() );
+      ( void ) esp_wifi_set_promiscuous( false );
+    }
+
+    printf( "       heard %u frames, %u data\n",
+            promisc_frames, promisc_data );
+    printf( "       data to this station %u, broadcast %u, protected %u\n",
+            promisc_data_to_us, promisc_data_bcast, promisc_data_prot );
+  }
+#endif
+
+#ifdef WIFI_NET_KEY_DELTA
+  if ( sta_connected_seen > 0 ) {
+    dump_key_region( "after " );
+  }
+#endif
+
+  /*
+   * Install the receive path again, now that the station has associated.
+   *
+   * The port installs it on WIFI_EVENT_STA_START, and
+   * esp_wifi_internal_reg_rxcb() does not keep a registration made before the
+   * association -- it reports ESP_OK and then never calls the callback.  This
+   * is well after WIFI_EVENT_STA_CONNECTED, because posting that event is
+   * itself too early: the driver installs its own callback somewhere after it.
+   */
+  if ( sta_connected_seen > 0 ) {
+    int rr = rtems_esp_netif_reattach();
+
+    printf( "rtems_esp_netif_reattach returned %i\n", rr );
+    check( "the receive path was reinstalled after associating", rr == 0 );
+  }
+
+  /*
+   * DHCP, but only if the station actually associated.
+   *
+   * Gated on the event rather than on a build-time flag, because the event is
+   * the condition that makes the difference.  A station that associated is on
+   * somebody else's network and the address compiled in above is almost
+   * certainly wrong for it; a station that did not has nothing to ask.  QEMU
+   * has no DHCP server and never reaches WIFI_EVENT_STA_CONNECTED, so it keeps
+   * the static address and the behaviour it had before, and the branch below
+   * is hardware-only without needing to say so.
+   *
+   * netifapi_dhcp_start() rather than dhcp_start().  dhcp_start() is core work
+   * -- it rewrites the netif's addresses and arms timeouts -- and this runs on
+   * Init, not the tcpip thread.  The netifapi wrapper does the handover.
+   *
+   * This is also what finally exercises receiving for real.  The scan proved
+   * beacons arrive, but a beacon is consumed inside libnet80211 and never
+   * reaches this layer; a DHCP offer is addressed to this station and comes up
+   * through esp32c3_netif_input(), which is the first frame to cross the eb
+   * boundary on hardware and the first time the ownership contract below is
+   * tested by anything other than QEMU.
+   */
+  if ( sta_connected_seen > 0 ) {
+    unsigned waited;
+
+    printf( "associated; starting DHCP...\n" );
+
+    err = netifapi_dhcp_start( &net_interface );
+    printf( "netifapi_dhcp_start returned %i\n", (int) err );
+    check( "DHCP started", err == ERR_OK );
+
+    /*
+     * Polled rather than waited on.  A netif status callback would need to
+     * hand the result back across threads for no gain here: the run has
+     * nothing else to do until an address arrives, and a poll makes the
+     * timeout explicit.
+     */
+    for ( waited = 0; waited < DHCP_WAIT_SECONDS; ++waited ) {
+      if ( dhcp_supplied_address( &net_interface ) ) {
+        break;
+      }
+
+      rtems_task_wake_after( rtems_clock_get_ticks_per_second() );
+    }
+
+    /*
+     * A real failure, not a "did not happen".  Reaching here means the station
+     * is associated to an access point, so a network that does not answer a
+     * discover in this long is worth reporting as broken rather than shrugged
+     * at -- and it is the only way this example can tell "associated" from
+     * "usable".
+     */
+    check( "DHCP bound an address", dhcp_supplied_address( &net_interface ) );
+
+    /*
+     * One call per line: ip4addr_ntoa() returns a pointer to a single static
+     * buffer, so two of them in one printf both show the second address.
+     */
+    printf( "       address %s\n",
+            ip4addr_ntoa( netif_ip4_addr( &net_interface ) ) );
+    printf( "       netmask %s\n",
+            ip4addr_ntoa( netif_ip4_netmask( &net_interface ) ) );
+    printf( "       gateway %s\n",
+            ip4addr_ntoa( netif_ip4_gw( &net_interface ) ) );
+
+#if WIFI_NET_PBUF_STARVE > 0 || WIFI_NET_RX_SOAK_SECONDS > 0
+    /*
+     * Load the receive path, with the pool optionally crippled first.
+     *
+     * The starve loop runs before the soak so that the flood meets the smaller
+     * pool rather than a full one.  The pbufs are held for the rest of the run
+     * on purpose -- freeing them would let the pool recover and the numbers at
+     * the end would describe a pool that was briefly small, which is not the
+     * failure being reproduced.
+     *
+     * pbuf_alloc() is asked for one full frame each time, which is one pool
+     * entry, so the count here is the count of entries taken.  A refusal ends
+     * the loop and is reported: it means the pool was already smaller than the
+     * request, which is worth seeing rather than looping on.
+     */
+    {
+      int soak = WIFI_NET_RX_SOAK_SECONDS;
+#if WIFI_NET_PBUF_STARVE > 0
+      int i;
+
+      printf( "holding %d pbuf pool entries...\n", WIFI_NET_PBUF_STARVE );
+
+      for ( i = 0; i < WIFI_NET_PBUF_STARVE; ++i ) {
+        if ( pbuf_alloc( PBUF_RAW, 1500, PBUF_POOL ) == NULL ) {
+          printf( "       pool refused entry %d of %d\n",
+                  i, WIFI_NET_PBUF_STARVE );
+          break;
+        }
+      }
+
+      printf( "       held %d\n", i );
+#endif
+
+      if ( soak > 0 ) {
+        printf( "soaking the receive path for %ds; flood this station now\n",
+                soak );
+        rtems_task_wake_after( (rtems_interval) soak *
+                               rtems_clock_get_ticks_per_second() );
+      }
+    }
+#endif
+
+#ifdef WIFI_NET_MAC_WORDS
+    /*
+     * The one block the fingerprint found a structural difference in.
+     *
+     * A stock ESP-IDF image on this board reads 0x60033200's first non-zero
+     * word as 0xc0000005 where this port reads 0x000001ff -- a configuration
+     * register holding a different value, not a counter caught at a different
+     * moment, which is what every other difference in that window turned out
+     * to be.  Word for word is the only way to say which offsets those are.
+     */
+    {
+      uint32_t base;
+
+      printf( "--- MAC words 0x60033c00..0x60033dfc ---\n" );
+
+      for ( base = 0x60034000u; base < 0x60036000u; base += 32u ) {
+        int i;
+
+        printf( "%08x:", (unsigned) base );
+
+        for ( i = 0; i < 8; ++i ) {
+          printf( " %08x",
+                  (unsigned) *(volatile uint32_t *) (uintptr_t)
+                    ( base + i * 4 ) );
+        }
+
+        printf( "\n" );
+      }
+    }
+#endif
+
+#ifdef WIFI_NET_MAC_FINGERPRINT
+    /*
+     * A fingerprint of the WiFi MAC window, for comparing against a stock
+     * ESP-IDF image on the same board and access point.
+     *
+     * Per 256-byte block, how many of its 64 words are non-zero.  Small enough
+     * to read in a log and precise enough to show which block holds key
+     * material -- the keys themselves differ between runs, so the comparison
+     * that means anything is populated-versus-empty, not value-versus-value.
+     *
+     * This is the measurement the A/B exists for.  The supplicant says it
+     * installed PTK and GTK and the driver agreed, and no encrypted frame
+     * passes afterwards; a block that stock fills and this does not says the
+     * key never reached the hardware, which is the same shape as the MAC clock
+     * bug where everything reported fine and the block was not there.
+     */
+    printf( "--- MAC window 0x60033000 fingerprint ---\n" );
+
+    {
+      uint32_t base;
+
+      for ( base = 0x60033000u; base < 0x60034000u; base += 0x100u ) {
+        int      nz    = 0;
+        uint32_t first = 0;
+        int      i;
+
+        for ( i = 0; i < 64; ++i ) {
+          uint32_t v = *(volatile uint32_t *) (uintptr_t) ( base + i * 4 );
+
+          if ( v != 0 ) {
+            if ( nz == 0 ) {
+              first = v;
+            }
+
+            ++nz;
+          }
+        }
+
+        if ( nz != 0 ) {
+          printf( "0x%08x: %2d/64 nonzero, first 0x%08x\n",
+                  (unsigned) base, nz, (unsigned) first );
+        } else {
+          printf( "0x%08x:  0/64\n", (unsigned) base );
+        }
+      }
+
+      printf( "clk_en 0x%08x rst_en 0x%08x\n",
+              (unsigned) *(volatile uint32_t *) (uintptr_t) 0x60026014u,
+              (unsigned) *(volatile uint32_t *) (uintptr_t) 0x60026018u );
+    }
+#endif
+
+#ifdef WIFI_NET_UDP_PROBE
+    /*
+     * Shout onto the LAN, so another host can say whether we are audible.
+     *
+     * Everything measured so far is from this station's own point of view, and
+     * none of it separates the two remaining possibilities: either our data
+     * frames never reach the access point -- accepted by the driver, encrypted
+     * with a key the AP does not share, and silently discarded -- or they do
+     * and the replies are being kept somewhere above the MAC.  A second
+     * machine on the same network settles it in one run.  If the datagrams
+     * arrive there, transmit works end to end and the fault is receive; if
+     * they do not, it is transmit, and the DHCP silence is a consequence
+     * rather than the problem.
+     *
+     * A chosen port rather than DHCP's own: port 68 needs privileges on the
+     * listening side, and the point is a test anyone can run.
+     *
+     * The source address is wrong for that network -- it is the static one
+     * compiled in above, since DHCP did not answer -- and that does not
+     * matter.  Delivery here is layer 2: the access point bridges a broadcast
+     * frame to the LAN whatever the IP header claims.
+     */
+    {
+      int s = socket( AF_INET, SOCK_DGRAM, 0 );
+
+      if ( s >= 0 ) {
+        struct sockaddr_in to;
+        int                on = 1;
+        int                i;
+
+        setsockopt( s, SOL_SOCKET, SO_BROADCAST, &on, sizeof( on ) );
+
+        memset( &to, 0, sizeof( to ) );
+        to.sin_family      = AF_INET;
+        to.sin_port        = htons( WIFI_NET_UDP_PROBE_PORT );
+        to.sin_addr.s_addr = htonl( INADDR_BROADCAST );
+
+        printf( "sending %d UDP broadcasts to port %d...\n",
+                WIFI_NET_UDP_PROBE_COUNT, WIFI_NET_UDP_PROBE_PORT );
+
+        for ( i = 0; i < WIFI_NET_UDP_PROBE_COUNT; ++i ) {
+          char msg[ 64 ];
+          int  n = snprintf( msg, sizeof( msg ),
+                             "rtems-esp32c3 %02x:%02x:%02x:%02x:%02x:%02x #%d",
+                             net_interface.hwaddr[ 0 ], net_interface.hwaddr[ 1 ],
+                             net_interface.hwaddr[ 2 ], net_interface.hwaddr[ 3 ],
+                             net_interface.hwaddr[ 4 ], net_interface.hwaddr[ 5 ],
+                             i );
+
+          if ( sendto( s, msg, (size_t) n, 0,
+                       (struct sockaddr *) &to, sizeof( to ) ) < 0 ) {
+            printf( "       sendto %d failed\n", i );
+          }
+
+          rtems_task_wake_after( rtems_clock_get_ticks_per_second() / 2 );
+        }
+
+        close( s );
+        printf( "       sent; tx_frames now %u\n",
+                (unsigned) stats->tx_frames );
+      }
+    }
+#endif
+
+#ifdef WIFI_NET_PROMISC_PROBE
+    if ( stats->rx_frames == 0 ) {
+      printf( "no frames reached the netif; counting what the radio hears\n" );
+
+      if ( esp_wifi_set_promiscuous_rx_cb( promisc_cb ) == ESP_OK &&
+           esp_wifi_set_promiscuous( true ) == ESP_OK ) {
+        rtems_task_wake_after( 5 * rtems_clock_get_ticks_per_second() );
+        ( void ) esp_wifi_set_promiscuous( false );
+      }
+
+      printf( "       promiscuous heard %u frames, %u of them data\n",
+              promisc_frames, promisc_data );
+      printf( "       addressed to this station: %u frames, %u of them data\n",
+              promisc_to_us, promisc_data_to_us );
+    }
+#endif
+  }
+
+  /*
    * Transmit.  Both shapes, because the chained one is the only path through
    * the staging buffer.  Refusal is expected and is not counted as a failure:
    * the station has not associated with anything.
    */
-  stats = rtems_esp_netif_get_stats();
   tx_before = stats->tx_frames + stats->tx_dropped_driver;
 
   err_single = transmit_one( &net_interface, false );
@@ -484,6 +1218,9 @@ done:
   printf( "\nnetif counters:\n" );
   rtems_esp_netif_print_stats();
 
+  printf( "\nlwip memory:\n" );
+  report_lwip_memory();
+
   /*
    * Said in words as well as in the zero above, because a reader who sees
    * eb_taken == eb_released might otherwise take it for a result.  It holds
@@ -525,6 +1262,45 @@ done:
       (unsigned) stats->rx_frames
     );
   }
+
+  /*
+   * Asserted, not just narrated.  Every paragraph above has described this
+   * contract and nothing has ever checked it, which is the failure mode #98
+   * is about: a check that reads as a result and is not one.
+   *
+   * It holds vacuously while rx_frames is 0 -- which is why the explanation
+   * above distinguishes the two cases -- but it is cheap and it is exactly the
+   * assertion that has to be in place before the first frame arrives, not
+   * after.  Leaking an eb handle is not an error at the time: it is a radio
+   * that goes quiet once the RX pool is gone, a long way from here.
+   */
+  check( "every eb handle the driver lent us was given back",
+         stats->eb_taken == stats->eb_released );
+
+  /*
+   * The pool was big enough for whatever this run was given.
+   *
+   * Like the eb check above it holds vacuously on an idle run -- a station
+   * that receives nothing cannot exhaust anything -- which is why it is worth
+   * stating what makes it non-vacuous: WIFI_NET_RX_SOAK_SECONDS with a host
+   * flooding the station, and WIFI_NET_PBUF_STARVE to show that the same two
+   * counters do move when the pool really is too small.
+   *
+   * Both halves matter.  rx_dropped_no_pbuf is this driver refusing a frame it
+   * had already taken off the radio; memp `err` is lwIP refusing anything from
+   * the pool, including allocations the stack makes for itself, so neither one
+   * contains the other.
+   */
+  check( "no frame was dropped for want of a pbuf",
+         stats->rx_dropped_no_pbuf == 0 );
+#if MEMP_STATS
+  check( "the pbuf pool never refused an allocation",
+         lwip_stats.memp[ MEMP_PBUF_POOL ]->err == 0 );
+#endif
+#if MEM_STATS
+  check( "the lwIP heap never refused an allocation",
+         lwip_stats.mem.err == 0 );
+#endif
 
   printf( "\n%d failure(s)\n", failures );
 
