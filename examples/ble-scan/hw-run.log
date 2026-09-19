@@ -1,46 +1,111 @@
-the modem domain...
-rtems-esp-bt: FE[0x174] 00000000 AGC[0x8c] 03fffa00 sysclk 000a8400
-rtems-esp-bt: powering the Bluetooth domain...
-rtems-esp-bt: registering the OS adapter (61 entries)...
-rtems-esp-bt: controller version 51d9dfd
-rtems-esp-bt: calibrating for MAC ac:a7:04:da:38:28
-rtems-esp-bt: register_chipv7_phy( PHY_RF_CAL_FULL )...
-ESP-ROM:esp32c3-api1-20210207
+rtems-esp-bt: semphr 0 created maESP-ROM:esp32c3-api1-20210207
 Build:Feb  7 2021
 rst:0x15 (USB_UART_CHIP_RESET),boot:0xd (SPI_FAST_FLASH_BOOT)
-Saved PC:0x42041f14
+Saved PC:0x42064a1a
 
 *** ESP32-C3 BLE SCAN ***
 config magic 0x5a5aa5a5 version 0x02509280
-rtems-esp-bt: copied 32892 bytes of IRAM and 300 of DRAM
+rtems-esp-bt: copied 32884 bytes of IRAM and 300 of DRAM
 rtems-esp-bt: powering the modem domain...
 rtems-esp-bt: FE[0x174] 00000000 AGC[0x8c] 03fffa00 sysclk 000a8400
+rtems-esp-bt: CLK_EN ffffffdf RST_EN 00000000 DIG_PWC 00041000 DIG_ISO 20800080
 rtems-esp-bt: powering the Bluetooth domain...
 rtems-esp-bt: registering the OS adapter (61 entries)...
 rtems-esp-bt: controller version 51d9dfd
 rtems-esp-bt: calibrating for MAC ac:a7:04:da:38:28
-rtems-esp-bt: register_chipv7_phy( PHY_RF_CAL_FULL )...
-rtems-esp-bt: no saved calibration, so the PHY calibrated fully
-rtems-esp-bt: bt_bb_v2_init_cmplx()...
 rtems-esp-bt: low power clock: main XTAL / 40
 rtems-esp-bt: btdm_controller_init()...
 rtems-esp-bt: controller ROM table ready
+rtems-esp-bt: semphr 0 created max 1 init 0
 rtems-esp-bt: queue 0: 5 x 8 bytes
+rtems-esp-bt: semphr 1 created max 1 init 0
+rtems-esp-bt: semphr 2 created max 1 init 1
 rtems-esp-bt: task 'btController' created, stack 4096, prio 23 -> 4
-rtems-esp-bt: controller task running
+rtems-esp-bt: queue_send ENTER q=0x3fc8dca4 id=0x22010001 size=8 sig=7
+rtems-esp-bt: queue_send EXIT sc=0
+rtems-esp-bt: semphr_take ENTER sem 0 (10000 ms) task 0x0a010001
+rtems-esp-bt: controller task 0x0a010003 running, entry 0x40380322
+rtems-esp-bt: semphr_take ENTER sem 1 (4294967295 ms) task 0x0a010003
 
 [monitor 3s] adapter calls 0x005  matrix 4..10: 0 0 0 0 0 0 0
+-------------------------------------------------------------------------------
+                              CPU USAGE BY THREAD
+------------+----------------------------------------+---------------+---------
+ ID         | NAME                                   | SECONDS       | PERCENT
+------------+----------------------------------------+---------------+---------
+ 0x09010001 | IDLE                                   |      4.002927 |  97.006
+ 0x0a010001 | UI1                                    |      0.113991 |   2.761
+ 0x0a010002 | MON                                    |      0.009389 |   0.227
+ 0x0a010003 | BTbt                                   |      0.002702 |   0.065
+------------+----------------------------------------+---------------+---------
+ TIME SINCE LAST CPU USAGE RESET IN SECONDS:                          4.130324
+-------------------------------------------------------------------------------
+  thread 0x0a010003 state 0x00000002: SEMAPHORE    waiting on thread queue ''
+
 
 [monitor 6s] adapter calls 0x005  matrix 4..10: 0 0 0 0 0 0 0
+-------------------------------------------------------------------------------
+                              CPU USAGE BY THREAD
+------------+----------------------------------------+---------------+---------
+ ID         | NAME                                   | SECONDS       | PERCENT
+------------+----------------------------------------+---------------+---------
+ 0x09010001 | IDLE                                   |      6.995239 |  98.024
+ 0x0a010001 | UI1                                    |      0.113991 |   1.597
+ 0x0a010002 | MON                                    |      0.026622 |   0.372
+ 0x0a010003 | BTbt                                   |      0.002702 |   0.037
+------------+----------------------------------------+---------------+---------
+ TIME SINCE LAST CPU USAGE RESET IN SECONDS:                          7.139837
+-------------------------------------------------------------------------------
+  thread 0x0a010003 state 0x00000002: SEMAPHORE    waiting on thread queue ''
+
 
 [monitor 9s] adapter calls 0x005  matrix 4..10: 0 0 0 0 0 0 0
+-------------------------------------------------------------------------------
+                              CPU USAGE BY THREAD
+------------+----------------------------------------+---------------+---------
+ ID         | NAME                                   | SECONDS       | PERCENT
+------------+----------------------------------------+---------------+---------
+ 0x09010001 | IDLE                                   |      9.989251 |  98.453
+ 0x0a010001 | UI1                                    |      0.113991 |   1.123
+ 0x0a010002 | MON                                    |      0.042429 |   0.418
+ 0x0a010003 | BTbt                                   |      0.002702 |   0.026
+------------+----------------------------------------+---------------+---------
+ TIME SINCE LAST CPU USAGE RESET IN SECONDS:                         10.149706
+-------------------------------------------------------------------------------
+  thread 0x0a010003 state 0x00000002: SEMAPHORE    waiting on thread queue ''
+
+rtems-esp-bt: semphr_take(10000 ms) by task 0x0a010001 = 0 after 9991 ms
 rtems-esp-bt: controller initialised
+rtems-esp-bt: r_plf_funcs_p=0x3fc99cd0 r_osi_funcs_p=0x3fc8de88
+rtems-esp-bt:   plf[40]=40000c14 (ROM r_btdm_task_post is 40000c14, blob impl is 42037000)
+rtems-esp-bt:   plf[248]=40386dac
+rtems-esp-bt: register_chipv7_phy( PHY_RF_CAL_FULL )...
+rtems-esp-bt: no saved calibration, so the PHY calibrated fully
+rtems-esp-bt: bt_bb_v2_init_cmplx()...
+rtems-esp-bt: power to automatic: DIG_PWC 00000000 DIG_ISO 00000080
 rtems-esp-bt: RWBT ISR on source 7: installed
 rtems-esp-bt: RWBLE ISR on source 8: installed
 rtems-esp-bt: BT_BB ISR on source 5: installed
 rtems-esp-bt: btdm_controller_enable( BLE )...
+rtems-esp-bt: queue_send ENTER q=0x3fc8dca4 id=0x22010001 size=8 sig=9
+rtems-esp-bt: queue_send EXIT sc=0
+rtems-esp-bt: semphr_take ENTER sem 0 (4294967295 ms) task 0x0a010001
 
 [monitor 12s] adapter calls 0x005  matrix 4..10: 0 22 0 6 6 0 0
+-------------------------------------------------------------------------------
+                              CPU USAGE BY THREAD
+------------+----------------------------------------+---------------+---------
+ ID         | NAME                                   | SECONDS       | PERCENT
+------------+----------------------------------------+---------------+---------
+ 0x09010001 | IDLE                                   |     12.916676 |  98.162
+ 0x0a010001 | UI1                                    |      0.180825 |   1.374
+ 0x0a010002 | MON                                    |      0.061247 |   0.465
+ 0x0a010003 | BTbt                                   |      0.002702 |   0.020
+------------+----------------------------------------+---------------+---------
+ TIME SINCE LAST CPU USAGE RESET IN SECONDS:                         13.162544
+-------------------------------------------------------------------------------
+  thread 0x0a010003 state 0x00000002: SEMAPHORE    waiting on thread queue ''
+
 [monitor] bring-up did not finish
 *** END OF ESP32-C3 BLE SCAN ***
 

@@ -53,18 +53,18 @@ app)
     $SP/esp32c3-bt-lib/esp32c3/libbtdm_app.a \
     $P/libbtbb.a $P/libphy.a \
     -Wl,--end-group -lm \
-    -T $H/esp_rom/esp32c3/ld/esp32c3.rom.ld \
-    -T $H/esp_rom/esp32c3/ld/esp32c3.rom.bt_funcs.ld \
-    -T $H/esp_rom/esp32c3/ld/esp32c3.rom.api.ld \
-    -T $H/esp_rom/esp32c3/ld/esp32c3.rom.ble_50.ld \
-    -T $H/esp_rom/esp32c3/ld/esp32c3.rom.ble_cca.ld \
-    -T $H/esp_rom/esp32c3/ld/esp32c3.rom.ble_dtm.ld \
-    -T $H/esp_rom/esp32c3/ld/esp32c3.rom.ble_master.ld \
-    -T $H/esp_rom/esp32c3/ld/esp32c3.rom.ble_scan.ld \
-    -T $H/esp_rom/esp32c3/ld/esp32c3.rom.ble_smp.ld \
-    -T $H/esp_rom/esp32c3/ld/esp32c3.rom.ble_test.ld \
-    -T $H/esp_rom/esp32c3/ld/esp32c3.rom.eco3.ld \
-    -T $H/esp_rom/esp32c3/ld/esp32c3.rom.eco3_bt_funcs.ld
+    -T $SP/romld/esp32c3.rom.ld \
+    -T $SP/romld/esp32c3.rom.bt_funcs.ld \
+    -T $SP/romld/esp32c3.rom.api.ld \
+    -T $SP/romld/esp32c3.rom.ble_50.ld \
+    -T $SP/romld/esp32c3.rom.ble_cca.ld \
+    -T $SP/romld/esp32c3.rom.ble_dtm.ld \
+    -T $SP/romld/esp32c3.rom.ble_master.ld \
+    -T $SP/romld/esp32c3.rom.ble_scan.ld \
+    -T $SP/romld/esp32c3.rom.ble_smp.ld \
+    -T $SP/romld/esp32c3.rom.ble_test.ld \
+    -T $SP/romld/esp32c3.rom.eco3.ld \
+    -T $SP/romld/esp32c3.rom.eco3_bt_funcs.ld
   riscv-rtems7-objcopy -O binary $SP/ble-scan.exe $SP/ble-scan.raw
   riscv-rtems7-size $SP/ble-scan.exe
   ;;

@@ -1172,10 +1172,31 @@ int rtems_esp_bt_controller_init( void *config )
     return -1;
   }
 
+  /* Before the adapter is registered, as ESP-IDF's btdm_controller_mem_init()
+   * does. */
+  btdm_controller_rom_data_init();
+
   printk( "rtems-esp-bt: registering the OS adapter (%u entries)...\n",
           (unsigned) ( ( sizeof( bt_osi_funcs ) - 8 ) / sizeof( void * ) ) );
 
-  result = btdm_osi_funcs_register( (void *) &bt_osi_funcs );
+  /*
+   * A writable copy, which is what ESP-IDF registers:
+   *
+   *   osi_funcs_p = malloc_internal_wrapper( sizeof( struct osi_funcs_t ) );
+   *   memcpy( osi_funcs_p, &osi_funcs_ro, sizeof( struct osi_funcs_t ) );
+   *   btdm_osi_funcs_register( osi_funcs_p );
+   *
+   * Measured: stock's r_osi_funcs_p is 0x3fc9922c, in RAM.  This port was
+   * registering the static const table directly, so r_osi_funcs_p pointed at
+   * 0x3c1842f8 -- flash rodata, where any write the controller makes is
+   * silently discarded rather than faulting.
+   */
+  {
+    static struct osi_funcs_t bt_osi_funcs_ram;
+
+    memcpy( &bt_osi_funcs_ram, &bt_osi_funcs, sizeof( bt_osi_funcs_ram ) );
+    result = btdm_osi_funcs_register( &bt_osi_funcs_ram );
+  }
 
   if ( result != 0 ) {
     printk( "rtems-esp-bt: btdm_osi_funcs_register failed (%d)\n", result );
@@ -1184,8 +1205,6 @@ int rtems_esp_bt_controller_init( void *config )
 
   printk( "rtems-esp-bt: controller version %s\n",
           btdm_controller_get_compile_version() );
-
-  btdm_controller_rom_data_init();
 
   bt_read_efuse_mac( bt_cal_data.mac );
   printk( "rtems-esp-bt: calibrating for MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -1224,6 +1243,22 @@ int rtems_esp_bt_controller_init( void *config )
   }
 
   printk( "rtems-esp-bt: controller initialised\n" );
+
+  {
+    const uint32_t *plf = *(const uint32_t **) (uintptr_t) 0x3fcdff80u;
+    const uint32_t *osi = *(const uint32_t **) (uintptr_t) 0x3fcdff84u;
+
+    printk( "rtems-esp-bt: r_plf_funcs_p=%p r_osi_funcs_p=%p\n",
+            (const void *) plf, (const void *) osi );
+
+    if ( plf != NULL ) {
+      printk( "rtems-esp-bt:   plf[40]=%08x (ROM r_btdm_task_post is "
+              "40000c14, blob impl is 42037000)\n",
+              (unsigned) plf[ 40 / 4 ] );
+      printk( "rtems-esp-bt:   plf[248]=%08x\n",
+              (unsigned) plf[ 248 / 4 ] );
+    }
+  }
 
   return 0;
 }
