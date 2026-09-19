@@ -398,6 +398,8 @@ static void *bt_semphr_create( uint32_t max, uint32_t init )
       return NULL;
     }
 
+    printk( "rtems-esp-bt: semphr %d created max %u init %u\n", i,
+            (unsigned) max, (unsigned) init );
     (void) max;
     bt_sem_used[ i ] = true;
     bt_sem_ids[ i ] = id;
@@ -426,20 +428,38 @@ static int bt_semphr_take( void *semphr, uint32_t block_time_ms )
 {
   rtems_esp_bt_calls |= BT_CALL_SEM_TAKE;
   rtems_id *slot = semphr;
+  int       result;
 
-  if ( rtems_semaphore_obtain( *slot, RTEMS_WAIT,
-                               bt_ms_to_ticks( block_time_ms ) )
-       == RTEMS_SUCCESSFUL ) {
-    return 1;
+  /* Diagnostics: what the blob actually asks for, and how long it gets. */
+  {
+    uint64_t t0 = rtems_clock_get_uptime_nanoseconds();
+
+    printk( "rtems-esp-bt: semphr_take ENTER sem %d (%u ms) task 0x%08x\n",
+            (int) ( slot - bt_sem_ids ), (unsigned) block_time_ms,
+            (unsigned) rtems_task_self() );
+
+    result = rtems_semaphore_obtain( *slot, RTEMS_WAIT,
+                                     bt_ms_to_ticks( block_time_ms ) )
+             == RTEMS_SUCCESSFUL ? 1 : 0;
+
+    printk( "rtems-esp-bt: semphr_take(%u ms) by task 0x%08x = %d after %u ms\n",
+            (unsigned) block_time_ms,
+            (unsigned) rtems_task_self(),
+            result,
+            (unsigned) ( ( rtems_clock_get_uptime_nanoseconds() - t0 )
+                           / 1000000u ) );
+
+    return result;
   }
-
-  return 0;
 }
 
 static int bt_semphr_give( void *semphr )
 {
   rtems_esp_bt_calls |= BT_CALL_SEM_GIVE;
   rtems_id *slot = semphr;
+
+  printk( "rtems-esp-bt: semphr_give from task 0x%08x\n",
+          (unsigned) rtems_task_self() );
 
   return rtems_semaphore_release( *slot ) == RTEMS_SUCCESSFUL ? 1 : 0;
 }
@@ -553,10 +573,18 @@ static int bt_queue_recv( void *queue, void *item, uint32_t block_time_ms )
   rtems_esp_bt_calls |= BT_CALL_Q_RECV;
   bt_queue_t *q = queue;
   size_t      size;
+  int         result;
 
-  return rtems_message_queue_receive( q->id, item, &size, RTEMS_WAIT,
-                                      bt_ms_to_ticks( block_time_ms ) )
-         == RTEMS_SUCCESSFUL ? 1 : 0;
+  printk( "rtems-esp-bt: queue_recv(%u ms) entered\n",
+          (unsigned) block_time_ms );
+
+  result = rtems_message_queue_receive( q->id, item, &size, RTEMS_WAIT,
+                                        bt_ms_to_ticks( block_time_ms ) )
+           == RTEMS_SUCCESSFUL ? 1 : 0;
+
+  printk( "rtems-esp-bt: queue_recv = %d\n", result );
+
+  return result;
 }
 
 static int bt_queue_recv_from_isr( void *queue, void *item, void *hptw )
@@ -584,7 +612,8 @@ static rtems_task bt_task_trampoline( rtems_task_argument arg )
 {
   bt_task_start_t *s = &bt_task_starts[ arg ];
 
-  printk( "rtems-esp-bt: controller task running\n" );
+  printk( "rtems-esp-bt: controller task 0x%08x running, entry %p\n",
+          (unsigned) rtems_task_self(), (void *) s->entry );
   ( *s->entry )( s->arg );
   printk( "rtems-esp-bt: controller task returned\n" );
 
@@ -668,6 +697,8 @@ static int bt_task_create(
 
 static void bt_task_delete( void *task_handle )
 {
+  printk( "rtems-esp-bt: _task_delete(%p) from task 0x%08x\n", task_handle,
+          (unsigned) rtems_task_self() );
   if ( task_handle == NULL ) {
     rtems_task_exit();
   }
