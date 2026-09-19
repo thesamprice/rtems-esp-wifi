@@ -1,0 +1,51 @@
+the modem domain...
+rtems-esp-bt: FE[0x174] 00000000 AGC[0x8c] 03fffa00 sysclk 000a8400
+rtems-esp-bt: powering the Bluetooth domain...
+rtems-esp-bt: registering the OS adapter (61 entries)...
+rtems-esp-bt: controller version 51d9dfd
+rtems-esp-bt: calibrating for MAC ac:a7:04:da:38:28
+rtems-esp-bt: register_chipv7_phy( PHY_RF_CAL_FULL )...
+ESP-ROM:esp32c3-api1-20210207
+Build:Feb  7 2021
+rst:0x15 (USB_UART_CHIP_RESET),boot:0xd (SPI_FAST_FLASH_BOOT)
+Saved PC:0x42041f14
+
+*** ESP32-C3 BLE SCAN ***
+config magic 0x5a5aa5a5 version 0x02509280
+rtems-esp-bt: copied 32892 bytes of IRAM and 300 of DRAM
+rtems-esp-bt: powering the modem domain...
+rtems-esp-bt: FE[0x174] 00000000 AGC[0x8c] 03fffa00 sysclk 000a8400
+rtems-esp-bt: powering the Bluetooth domain...
+rtems-esp-bt: registering the OS adapter (61 entries)...
+rtems-esp-bt: controller version 51d9dfd
+rtems-esp-bt: calibrating for MAC ac:a7:04:da:38:28
+rtems-esp-bt: register_chipv7_phy( PHY_RF_CAL_FULL )...
+rtems-esp-bt: no saved calibration, so the PHY calibrated fully
+rtems-esp-bt: bt_bb_v2_init_cmplx()...
+rtems-esp-bt: low power clock: main XTAL / 40
+rtems-esp-bt: btdm_controller_init()...
+rtems-esp-bt: controller ROM table ready
+rtems-esp-bt: queue 0: 5 x 8 bytes
+rtems-esp-bt: task 'btController' created, stack 4096, prio 23 -> 4
+rtems-esp-bt: controller task running
+
+[monitor 3s] adapter calls 0x005  matrix 4..10: 0 0 0 0 0 0 0
+
+[monitor 6s] adapter calls 0x005  matrix 4..10: 0 0 0 0 0 0 0
+
+[monitor 9s] adapter calls 0x005  matrix 4..10: 0 0 0 0 0 0 0
+rtems-esp-bt: controller initialised
+rtems-esp-bt: RWBT ISR on source 7: installed
+rtems-esp-bt: RWBLE ISR on source 8: installed
+rtems-esp-bt: BT_BB ISR on source 5: installed
+rtems-esp-bt: btdm_controller_enable( BLE )...
+
+[monitor 12s] adapter calls 0x005  matrix 4..10: 0 22 0 6 6 0 0
+[monitor] bring-up did not finish
+*** END OF ESP32-C3 BLE SCAN ***
+
+[ RTEMS shutdown ]
+RTEMS version: 7.0.0.cbefccfc90c7b8215dfc53ba52377731bb3ebbb5
+RTEMS tools: 15.2.0 20250808 (RTEMS 7, Build 2026.06.12, RSB 105f43d299cb5c367fc5f2b0147f401721ed3d9c-modified, Newlib 7d4336cf)
+executing thread ID: 0x0a010002
+executing thread name: MON 
