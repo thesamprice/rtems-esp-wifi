@@ -552,12 +552,20 @@ static void bt_queue_delete( void *queue )
 static int bt_queue_send( void *queue, void *item, uint32_t block_time_ms )
 {
   rtems_esp_bt_calls |= BT_CALL_Q_SEND;
-  bt_queue_t *q = queue;
+  bt_queue_t       *q = queue;
+  rtems_status_code sc;
 
   (void) block_time_ms;
 
-  return rtems_message_queue_send( q->id, item, q->item_size )
-         == RTEMS_SUCCESSFUL ? 1 : 0;
+  printk( "rtems-esp-bt: queue_send ENTER q=%p id=0x%08x size=%u sig=%u\n",
+          queue, (unsigned) q->id, (unsigned) q->item_size,
+          (unsigned) *(const uint32_t *) item );
+
+  sc = rtems_message_queue_send( q->id, item, q->item_size );
+
+  printk( "rtems-esp-bt: queue_send EXIT sc=%d\n", (int) sc );
+
+  return sc == RTEMS_SUCCESSFUL ? 1 : 0;
 }
 
 static int bt_queue_send_from_isr( void *queue, void *item, void *hptw )
