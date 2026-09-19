@@ -274,8 +274,7 @@ static void bt_modem_domain_on( void )
    * clock that should be off is power and the cost of one that should be on
    * is a block that never runs.
    */
-  reg = REG( CLK_EN_REG );
-  REG( CLK_EN_REG ) = ( reg | 0xffffffffu ) & ~( 1u << 5 );
+  REG( CLK_EN_REG ) = 0xffffffffu;
 
   /*
    * The internal analog I2C master, which is how libphy reaches the analog
@@ -1233,6 +1232,31 @@ int rtems_esp_bt_controller_init( void *config )
 
   printk( "rtems-esp-bt: low power clock: main XTAL / 40\n" );
 
+  /*
+   * The PHY, before btdm_controller_init().
+   *
+   * ESP-IDF v5.5 does this in esp_bt_controller_enable() instead, and this
+   * port followed it there.  NuttX's esp32c3_ble_adapter.c -- the other
+   * non-FreeRTOS port of this same blob, and therefore the closer reference
+   * for what the contract actually requires rather than what one RTOS happens
+   * to do -- calls bt_phy_enable() immediately before btdm_controller_init().
+   */
+  phy_bbpll_en_usb( true );
+
+  printk( "rtems-esp-bt: register_chipv7_phy( PHY_RF_CAL_FULL )...\n" );
+
+  result = register_chipv7_phy( phy_init_data, &bt_cal_data, PHY_RF_CAL_FULL );
+
+  if ( result == ESP_CAL_DATA_CHECK_FAIL ) {
+    printk( "rtems-esp-bt: no saved calibration, so the PHY calibrated fully\n" );
+  } else if ( result != 0 ) {
+    printk( "rtems-esp-bt: register_chipv7_phy failed (%d)\n", result );
+    return -1;
+  }
+
+  printk( "rtems-esp-bt: bt_bb_v2_init_cmplx()...\n" );
+  bt_bb_v2_init_cmplx( 0 );
+
   printk( "rtems-esp-bt: btdm_controller_init()...\n" );
 
   result = btdm_controller_init( config );
@@ -1268,36 +1292,7 @@ volatile uint32_t rtems_esp_bt_calls;
 int rtems_esp_bt_controller_enable( void );
 int rtems_esp_bt_controller_enable( void )
 {
-
   int result;
-
-  /*
-   * The PHY belongs here, not in init.
-   *
-   * ESP-IDF's esp_bt_controller_init() does not touch the radio at all: it
-   * powers the domain, registers the adapter and calls btdm_controller_init().
-   * esp_phy_enable( PHY_MODEM_BT ) -- which is register_chipv7_phy() followed
-   * by bt_bb_v2_init_cmplx() -- happens in esp_bt_controller_enable(), after
-   * the controller has initialised, and the comment there spells the order out.
-   *
-   * This port had it the other way round and btdm_controller_enable() never
-   * returned.
-   */
-  phy_bbpll_en_usb( true );
-
-  printk( "rtems-esp-bt: register_chipv7_phy( PHY_RF_CAL_FULL )...\n" );
-
-  result = register_chipv7_phy( phy_init_data, &bt_cal_data, PHY_RF_CAL_FULL );
-
-  if ( result == ESP_CAL_DATA_CHECK_FAIL ) {
-    printk( "rtems-esp-bt: no saved calibration, so the PHY calibrated fully\n" );
-  } else if ( result != 0 ) {
-    printk( "rtems-esp-bt: register_chipv7_phy failed (%d)\n", result );
-    return -1;
-  }
-
-  printk( "rtems-esp-bt: bt_bb_v2_init_cmplx()...\n" );
-  bt_bb_v2_init_cmplx( 0 );
 
   /*
    * Hand the power domains back to the hardware before starting the link
