@@ -60,6 +60,7 @@ extern void btdm_controller_disable( void );
  * through components/esp_phy/src/btbb_init.c.
  */
 extern void bt_bb_v2_init_cmplx( int print_version );
+extern void sdk_config_extend_set_pll_track( bool enable );
 extern void btdm_controller_enable_sleep( bool enable );
 extern bool btdm_lpclk_select_src( uint32_t sel );
 extern bool btdm_lpclk_set_div( uint32_t div );
@@ -1131,27 +1132,6 @@ int rtems_esp_bt_controller_init( void *config )
           bt_cal_data.mac[ 0 ], bt_cal_data.mac[ 1 ], bt_cal_data.mac[ 2 ],
           bt_cal_data.mac[ 3 ], bt_cal_data.mac[ 4 ], bt_cal_data.mac[ 5 ] );
 
-  phy_bbpll_en_usb( true );
-
-  printk( "rtems-esp-bt: register_chipv7_phy( PHY_RF_CAL_FULL )...\n" );
-
-  result = register_chipv7_phy( phy_init_data, &bt_cal_data, PHY_RF_CAL_FULL );
-
-  if ( result == ESP_CAL_DATA_CHECK_FAIL ) {
-    printk( "rtems-esp-bt: no saved calibration, so the PHY calibrated fully\n" );
-  } else if ( result != 0 ) {
-    printk( "rtems-esp-bt: register_chipv7_phy failed (%d)\n", result );
-    return -1;
-  }
-
-  /*
-   * The Bluetooth baseband, which is a separate library from the PHY and is
-   * what esp_phy_enable( PHY_MODEM_BT ) calls after register_chipv7_phy().
-   * Argument 0 keeps it quiet; 1 makes it print its version.
-   */
-  printk( "rtems-esp-bt: bt_bb_v2_init_cmplx()...\n" );
-  bt_bb_v2_init_cmplx( 0 );
-
   /*
    * The link layer's time base, and the step whose absence looks exactly like
    * a hang.
@@ -1193,9 +1173,41 @@ volatile uint32_t rtems_esp_bt_calls;
 int rtems_esp_bt_controller_enable( void );
 int rtems_esp_bt_controller_enable( void )
 {
+
   int result;
 
+  /*
+   * The PHY belongs here, not in init.
+   *
+   * ESP-IDF's esp_bt_controller_init() does not touch the radio at all: it
+   * powers the domain, registers the adapter and calls btdm_controller_init().
+   * esp_phy_enable( PHY_MODEM_BT ) -- which is register_chipv7_phy() followed
+   * by bt_bb_v2_init_cmplx() -- happens in esp_bt_controller_enable(), after
+   * the controller has initialised, and the comment there spells the order out.
+   *
+   * This port had it the other way round and btdm_controller_enable() never
+   * returned.
+   */
+  phy_bbpll_en_usb( true );
+
+  printk( "rtems-esp-bt: register_chipv7_phy( PHY_RF_CAL_FULL )...\n" );
+
+  result = register_chipv7_phy( phy_init_data, &bt_cal_data, PHY_RF_CAL_FULL );
+
+  if ( result == ESP_CAL_DATA_CHECK_FAIL ) {
+    printk( "rtems-esp-bt: no saved calibration, so the PHY calibrated fully\n" );
+  } else if ( result != 0 ) {
+    printk( "rtems-esp-bt: register_chipv7_phy failed (%d)\n", result );
+    return -1;
+  }
+
+  printk( "rtems-esp-bt: bt_bb_v2_init_cmplx()...\n" );
+  bt_bb_v2_init_cmplx( 0 );
+
   btdm_controller_enable_sleep( false );
+
+  /* ESP-IDF disables PLL track on the C3 and S3 before enabling. */
+  sdk_config_extend_set_pll_track( false );
 
   /*
    * No coex_pti_v2() and no coex_enable().  Both live in libcoexist.a, which
