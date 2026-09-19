@@ -192,6 +192,11 @@ static void bt_delay_us_early( uint32_t us )
 #define RTC_DIG_PWC_REG    ( RTC_BASE_ADDR + 0x088u )
 #define RTC_DIG_ISO_REG    ( RTC_BASE_ADDR + 0x08Cu )
 
+#define BT_FORCE_PD_BIT    ( 1u << 11 )
+#define BT_FORCE_PU_BIT    ( 1u << 12 )
+#define BT_FORCE_ISO_BIT   ( 1u << 22 )
+#define BT_FORCE_NOISO_BIT ( 1u << 23 )
+
 #define WIFI_FORCE_PD      ( 1u << 17 )
 #define WIFI_FORCE_PU      ( 1u << 18 )
 #define WIFI_PD_EN         ( 1u << 30 )
@@ -255,9 +260,22 @@ static void bt_modem_domain_on( void )
   reg |= WIFI_FORCE_NOISO;
   REG( RTC_DIG_ISO_REG ) = reg;
 
-  /* The PHY's own clock, which the power-up sequence does not leave on. */
+  /*
+   * Every modem clock, which is what stock runs with.
+   *
+   * Measured on the same board under ESP-IDF while it was scanning:
+   * SYSTEM_WIFI_CLK_EN_REG reads 0xffffffdf, so the only bit stock leaves
+   * clear is 5, the RTC-slow I2C clock.  This port was setting
+   * WIFI_BT_COMMON plus PHY_EN plus the three Bluetooth bits and nothing
+   * else, and there is no public header naming what the rest do -- the WiFi
+   * port found the MAC's clock by bisection for exactly this reason.
+   *
+   * Matching stock rather than reasoning about it, because the cost of a
+   * clock that should be off is power and the cost of one that should be on
+   * is a block that never runs.
+   */
   reg = REG( CLK_EN_REG );
-  REG( CLK_EN_REG ) = reg | CLK_WIFI_BT_COMMON | CLK_PHY_EN;
+  REG( CLK_EN_REG ) = ( reg | 0xffffffffu ) & ~( 1u << 5 );
 
   /*
    * The internal analog I2C master, which is how libphy reaches the analog
@@ -296,6 +314,9 @@ static void bt_modem_domain_on( void )
   printk( "rtems-esp-bt: FE[0x174] %08x AGC[0x8c] %08x sysclk %08x\n",
           (unsigned) REG( 0x60006174u ), (unsigned) REG( 0x6001C08Cu ),
           (unsigned) REG( SYSCLK_CONF_REG ) );
+  printk( "rtems-esp-bt: CLK_EN %08x RST_EN %08x DIG_PWC %08x DIG_ISO %08x\n",
+          (unsigned) REG( CLK_EN_REG ), (unsigned) REG( RST_EN_REG ),
+          (unsigned) REG( RTC_DIG_PWC_REG ), (unsigned) REG( RTC_DIG_ISO_REG ) );
 }
 
 /* -------------------------------------------------------------------- */
@@ -1203,6 +1224,40 @@ int rtems_esp_bt_controller_enable( void )
 
   printk( "rtems-esp-bt: bt_bb_v2_init_cmplx()...\n" );
   bt_bb_v2_init_cmplx( 0 );
+
+  /*
+   * Hand the power domains back to the hardware before starting the link
+   * layer.
+   *
+   * The FORCE_PU and FORCE_NOISO bits are what the WiFi port needed to get
+   * register_chipv7_phy() to run at all on this boot path, and they are still
+   * needed for that -- the calibration above has just finished using them.
+   * But the controller has its own power state machine, rw_sleep_enable() and
+   * r_rwip_prevent_sleep_set() and the btdm_power_state it keeps, and pinning
+   * the domain under it means a transition it waits on can never be observed.
+   *
+   * Measured on the same board under ESP-IDF while it was scanning: DIG_PWC
+   * reads 0x00000000 and DIG_ISO reads 0x00000080, so stock runs the
+   * controller with no force bits at all.  This port reached
+   * btdm_controller_enable() with 0x00041000 and 0x20800080, which was the
+   * last hardware difference left after the clocks were matched.
+   */
+  {
+    uint32_t reg = REG( RTC_DIG_PWC_REG );
+
+    reg &= ~( BT_FORCE_PU_BIT | WIFI_FORCE_PU | BT_FORCE_PD_BIT |
+              WIFI_FORCE_PD );
+    REG( RTC_DIG_PWC_REG ) = reg;
+
+    reg = REG( RTC_DIG_ISO_REG );
+    reg &= ~( BT_FORCE_NOISO_BIT | WIFI_FORCE_NOISO | BT_FORCE_ISO_BIT |
+              WIFI_FORCE_ISO );
+    REG( RTC_DIG_ISO_REG ) = reg;
+
+    printk( "rtems-esp-bt: power to automatic: DIG_PWC %08x DIG_ISO %08x\n",
+            (unsigned) REG( RTC_DIG_PWC_REG ),
+            (unsigned) REG( RTC_DIG_ISO_REG ) );
+  }
 
   btdm_controller_enable_sleep( false );
 
